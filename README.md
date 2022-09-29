@@ -4,7 +4,7 @@ Processing crowdsourced bathymetry from International Hydrographic Office's Data
 Basic steps are: 
 1. Read in CSV file and perform basic outlier filtering (also filters out Anonymous vessels)
 2. Spatially join CSB points with tide zone polygons
-3. Download waterlevel/tide data from tide control stations for time period of CSB
+3. Download waterlevel/tide data from tide control stations for time period of CSB from NOAA COOPS datagetter web API
 4. Perform waterlevel correction to MLLW
 5. Extract 5m geotiff from best available NOAA BAG bathymetry in the area
 6. Extract raster values to CSB points, perform aggregated summary stats of difference between CSB depth and BAG bathymetry.              
