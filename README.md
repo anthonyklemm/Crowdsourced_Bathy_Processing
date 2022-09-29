@@ -14,6 +14,7 @@ Basic steps are:
 
 Images: Comparison of CSB grid (IDW algorithm) vs Hydrographic Survey H13387 in Houston, TX Harbor
 
+![Screenshot](https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/csb_vs_BAG.gif?raw=true)
 ![Screenshot](https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/images/2022-09-29_9-10-00.png?raw=true)
 ![Screenshot](https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/images/2022-09-29_8-46-32.png?raw=true)
 ![Screenshot](https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/images/2022-09-29_8-47-30.png?raw=true)
