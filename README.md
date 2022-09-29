@@ -13,3 +13,4 @@ Basic steps are:
 9. Export CSB points to shapefile for further bathy processing in ArcGIS Pro (IDW gridding, etc...) -***Would like to integrate gridding into python script***
 
 Images: Comparison of CSB grid (IDW algorithm) vs Hydrographic Survey H13387 in Houston, TX Harbor
+!https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/images/2022-09-29_8-46-32.png
