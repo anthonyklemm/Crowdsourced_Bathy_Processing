@@ -11,3 +11,5 @@ Basic steps are:
 7. Use this table choose unapplied static vertical transducer offsets of each vessel (any mean diff that has a std dev < 1.0m)
 8. Apply the data-derived static offsets to the CSB data by performing an inner join with the offset table and CSB points
 9. Export CSB points to shapefile for further bathy processing in ArcGIS Pro (IDW gridding, etc...) -***Would like to integrate gridding into python script***
+
+Images: Comparison of CSB grid (IDW algorithm) vs Hydrographic Survey H13387 in Houston, TX Harbor
