@@ -26,25 +26,30 @@ import os
 from osgeo import gdal
 from rasterstats import point_query
 
-pd.set_option('display.max_columns', None)
-title = 'Houston_CSB'
 
+pd.set_option('display.max_columns', None)
+title = 'False_Pass_CSB'
+
+fp_zones = r"F:\csb\tide zone polygons\tide_zone_polygons_new_WGS84.shp"
+csb = r"E:\CSB_13SEPT2021\False_Pass.csv"
+BAG_filepath = "E:/CSB_13SEPT2021/H12632_MBVB_4m_MLLW_Combined.bag"
 
 print('*****Reading CSB input csv file***** ')
-df=gpd.read_file("F:\csb\houston_CSB.csv") #read in CSB data in CSV
+df=gpd.read_file(csb) #read in CSB data in CSV
 df1=df[df['platform'] != "Anonymous"] #filter out "Anonymous" vessels (can't do a vessel by vessel offset comparison against valid data)
 df1 = df1.astype({'depth' : 'float'}) #turn depth field numeric (float64)
-df2=df1[df1['depth'] > 1.2] #remove depth values less that 1.2m (filtering out probable noise)
-df2=df2[df2['depth'] < 30] #remove depths values greater than possible depths in the area - this value can change based on area)
+df2=df1[df1['depth'] > .5] #remove depth values less that 1.2m (filtering out probable noise)
+df2=df2[df2['depth'] < 1000] #remove depths values greater than possible depths in the area - this value can change based on area)
 gdf = gpd.GeoDataFrame(df2, geometry=gpd.points_from_xy(df2.lon, df2.lat)) #create vector point file from lat and lon
 gdf = gdf.set_crs(4326, allow_override=True)
+#print(gdf)
 print('CSV data csv file loaded. Starting tide correction')
 
-fp_zones = r"F:\csb\tide zone polygons\tide_zone_polygons.shp"
+
 zones=gpd.read_file(fp_zones)
 join = gpd.sjoin(gdf, zones, how='inner', predicate='within')
 join = join.astype({'time':'datetime64'})
-print(join)
+#print(join)
 
 ts = join.groupby('ControlStn').agg(['min','max'])
 ts = ts['time']
@@ -54,33 +59,43 @@ ts = ts.reset_index(drop=False)
 #format timestamps for NOAA CO-OPS Tidal Data API
 ts['min'] = ts['min'].dt.strftime("%Y%m%d %H:%M")
 ts['max'] = ts['max'].dt.strftime("%Y%m%d %H:%M")
-#ts['ControlStn'] = ts.astype(str)
 
+ts = ts.astype({'min': 'datetime64'})
+ts = ts.astype({'max': 'datetime64'})
 
-#write code to break up 'ts' dataframe  
-ts_1 = (pd.DataFrame(columns=['NULL'], index=pd.date_range(start=ts['min'][0], end=ts['max'][0], freq='M')).between_time('00:00','23:59')
-       .index.strftime("%Y%m%d %H:%M")
-       .tolist())
+ts.rename(columns = {'min':'StartDate', 'max':'EndDate'}, inplace=True)
+print(ts)
+ts = ts.set_index('StartDate')
+new_df = pd.DataFrame()
+for i, data in ts.iterrows():
+    data = data.to_frame().transpose()
+    data = data.reindex(pd.date_range(start=data.index[0], end=data.EndDate[0])).fillna(method='ffill').reset_index().rename(columns={'index': 'StartDate'})
+    new_df = pd.concat([new_df, data])
 
-ts_1 = pd.DataFrame(ts_1, columns = ['min'])
-ts_1['min'] = pd.to_datetime(ts_1['min'])
-ts_1['max'] = ts_1['min'] + pd.Timedelta(days=31)
-ts_1['min'] = ts_1['min'].dt.strftime("%Y%m%d %H:%M")
-ts_1['max'] = ts_1['max'].dt.strftime("%Y%m%d %H:%M")
-print(ts_1)
-#get tide data from referenced control stations
+new_df = new_df[['ControlStn','StartDate', 'EndDate']]
+new_df['EndDate'] = new_df['StartDate']+pd.Timedelta(days=1)
+new_df.rename(columns = {'StartDate':'min','EndDate': 'max'}, inplace=True)
+new_df['min'] = new_df['min'].dt.strftime("%Y%m%d %H:%M")
+new_df['max'] = new_df['max'].dt.strftime("%Y%m%d %H:%M")
+new_df = new_df.reset_index()
+print(new_df)
+print('*****retrieving tide data from NOAA COOPS API*****')
+
 tdf = []
-for ind in ts_1.index:
-    URL_API = 'https://tidesandcurrents.noaa.gov/api/datagetter?begin_date='+ts_1['min'][ind]+'&end_date='+ts_1['max'][ind]+'&station='+'8770733'+'&product=predictions&datum=mllw&units=metric&time_zone=gmt&application=NOAA_Coast_Survey&format=json'
-    print(URL_API)
-    response = requests.get(URL_API)
-    json_dict = response.json()
-    #print(json_dict)
-    #export out as individual json files of the reference tide station data
-    #out_file = open("E:/csb/jsondump1/"+'8770733'+'.json', 'w')
-    #json.dump(json_dict, out_file, indent = 6)
-    #out_file.close()
+for ind in new_df.index:
+    try:
     
+        URL_API = 'https://tidesandcurrents.noaa.gov/api/datagetter?begin_date='+new_df['min'][ind]+'&end_date='+new_df['max'][ind]+'&station='+new_df['ControlStn'][ind]+'&product=predictions&datum=mllw&units=metric&time_zone=gmt&application=NOAA_Coast_Survey&format=json'
+        print(URL_API)
+        response = requests.get(URL_API)
+        json_dict = response.json()
+        #print(json_dict)
+        #export out as individual json files of the reference tide station data
+        #out_file = open("E:/csb/jsondump1/"+'8770733'+'.json', 'w')
+        #json.dump(json_dict, out_file, indent = 6)
+        #out_file.close()
+    except Exception:
+            continue
     try:
         data = pd.json_normalize(json_dict["predictions"])
         data[['v']] = data[['v']].apply(pd.to_numeric)
@@ -108,7 +123,8 @@ newdf = jtdf[['t_corr','v']].copy()
 newdf = newdf.rename(columns={'v':'v_new', 't_corr':'t_new'})
 newdf = newdf.sort_values('t_new')
 newdf = newdf.dropna() 
-csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new')
+
+csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new', direction='nearest')
 csb_corr = csb_corr.dropna()
 
 csb_corr['depth_new'] = csb_corr['depth'] - (csb_corr['RR'] * csb_corr['v_new'])                
@@ -127,15 +143,15 @@ print('*****Starting to import BAG bathy and aggregate to 5m geotiff*****')
 #how to convert BAG to geotiff and extract just the elevation layer (and resample if wanted)
 
 
-dataset = gdal.Open("E:/CSB_13SEPT2021/H13387_MB_50cm_MLLW_1of1.bag", gdal.GA_ReadOnly)
-gdal.Translate('E:/CSB_13SEPT2021/H13387_MB_50cm_MLLW_1of1.tif', dataset) #converts BAG to dual band geotiff
-dsReprj = gdal.Warp('E:/CSB_13SEPT2021/H13387_MB_5m_MLLW.tif', 'E:/CSB_13SEPT2021/H13387_MB_50cm_MLLW_1of1.tif', xRes = 5, yRes=5) #resamples the input geotiff to 10m raster
+dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
+gdal.Translate('E:/CSB_13SEPT2021/' + title+ '.tif', dataset) #converts BAG to dual band geotiff
+dsReprj = gdal.Warp('E:/CSB_13SEPT2021/' + title+'_5m_MLLW.tif', 'E:/CSB_13SEPT2021/' + title + '.tif', xRes = 5, yRes=5) #resamples the input geotiff to 10m raster
 
-
-os.system("gdal_translate -b 1 -of AAIGrid E:/CSB_13SEPT2021/H13387_MB_5m_MLLW.tif E:/CSB_13SEPT2021/H13387_MB_5m_elevation.tif") #extracts the elevation band (band1) and saves as new geotiff
-raster_file = 'E:/CSB_13SEPT2021/H13387_MB_5m_elevation.tif'
+str1 = "gdal_translate -b 1 -of AAIGrid " + 'E:/CSB_13SEPT2021/' + title +'_5m_MLLW.tif E:/CSB_13SEPT2021/' + title + '_MB_5m_elevation.tif'
+os.system(str1) #extracts the elevation band (band1) and saves as new geotiff
+raster_file = 'E:/CSB_13SEPT2021/' + title + '_MB_5m_elevation.tif'
 input_raster = gdal.Open(raster_file)
-output_raster = 'E:/CSB_13SEPT2021/H13387_MB_5m_wgs84.tif'
+output_raster = 'E:/CSB_13SEPT2021/' + title + '_MB_5m_elevation_wgs84.tif'
 warp = gdal.Warp(output_raster, input_raster, dstSRS='EPSG:4326')
 warp = None
 
@@ -145,17 +161,17 @@ print('*****bathy file processed, 5m geotiff creation complete. Starting raster 
 #need to make sure bag and points are in the same spatial/coordinate reference system/projection
 
 
-pts = point_query(csb_corr, 'E:/CSB_13SEPT2021/H13387_MB_5m_wgs84.tif') #this seems to take a long time
+pts = point_query(csb_corr, output_raster) #this seems to take a long time
 print('*****raster depth extraction complete. Calculating and aggregating depth difference statistics. Aggregated results will be stored in the pandas dataframe named: out*****')
 #next, take resulting pts1 list and add as new column to pts gdf. 
 csb_corr["Raster_Value"] = pts
 csb_corr['diff'] = csb_corr['depth_new'] - (csb_corr['Raster_Value'] * -1) #create new column of diff between raster value and observed csb depth
 out=csb_corr.groupby('platform')['diff'].agg(['mean','std','count']).reset_index() #create new dataframe of vessels showing summary stats for diff
 print(out)
-out.to_csv('E:/CSB_13SEPT2021/VESSEL_OFFSETS_csb_corr_houston.csv')
+out.to_csv('E:/CSB_13SEPT2021/VESSEL_OFFSETS_csb_corr_'+ title +'.csv')
 
 #join vessel static offset table with csb data (1m std threshold for defining vertical transducer offset)
-csb_corr1 = pd.merge(csb_corr, out[out['std'] < 1.0], on='platform')
+csb_corr1 = pd.merge(csb_corr, out[out['std'] < 2.0], on='platform')
 csb_corr1['depth_final'] = csb_corr1['depth_new'] - csb_corr1['mean'] #correct csb bathy with transducer offset
 
 print('*****exporting tide and vessel offset corrected csb to shapefile*****')
