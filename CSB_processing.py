@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Mon Dec 28 13:57:44 2020
-Updated 9/29/2022
+Updated 10/05/2022
 
 This script automates the tide correction of crowdsourced bathymetry (CSB) files (in CSV format)
 downloaded from the Internation Hydrographic Organization's (IHO) Data Centre for Digital Bathymetry 
@@ -64,7 +64,7 @@ ts = ts.astype({'min': 'datetime64'})
 ts = ts.astype({'max': 'datetime64'})
 
 ts.rename(columns = {'min':'StartDate', 'max':'EndDate'}, inplace=True)
-print(ts)
+#print(ts)
 ts = ts.set_index('StartDate')
 new_df = pd.DataFrame()
 for i, data in ts.iterrows():
@@ -78,7 +78,7 @@ new_df.rename(columns = {'StartDate':'min','EndDate': 'max'}, inplace=True)
 new_df['min'] = new_df['min'].dt.strftime("%Y%m%d %H:%M")
 new_df['max'] = new_df['max'].dt.strftime("%Y%m%d %H:%M")
 new_df = new_df.reset_index()
-print(new_df)
+#print(new_df)
 print('*****retrieving tide data from NOAA COOPS API*****')
 
 tdf = []
@@ -107,7 +107,7 @@ try:
     tdf = pd.concat(tdf)
 except Exception:
     pass
-print(tdf)
+#print(tdf)
 tdf = tdf.sort_values('t')
 join = join.sort_values('time')
       
@@ -136,7 +136,7 @@ csb_corr = csb_corr[csb_corr['depth'] > 1.5]
 csb_corr = csb_corr[csb_corr['depth'] < 1000]
 csb_corr = csb_corr.rename(columns={'depth':'depth_old'})
 csb_corr = csb_corr.drop(columns=['index_right','ATCorr','RR','ATCorr2','RR2','DataProv','Shape_Leng','Shape_Area','Shape_Le_1','t','v','t_corr','t_new','v_new'])
-print(csb_corr)
+#print(csb_corr)
 
 
 print('*****Starting to import BAG bathy and aggregate to 5m geotiff*****')
@@ -167,7 +167,7 @@ print('*****raster depth extraction complete. Calculating and aggregating depth 
 csb_corr["Raster_Value"] = pts
 csb_corr['diff'] = csb_corr['depth_new'] - (csb_corr['Raster_Value'] * -1) #create new column of diff between raster value and observed csb depth
 out=csb_corr.groupby('platform')['diff'].agg(['mean','std','count']).reset_index() #create new dataframe of vessels showing summary stats for diff
-print(out)
+#print(out)
 out.to_csv('E:/CSB_13SEPT2021/VESSEL_OFFSETS_csb_corr_'+ title +'.csv')
 
 #join vessel static offset table with csb data (1m std threshold for defining vertical transducer offset)
