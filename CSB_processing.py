@@ -7,9 +7,9 @@ This script automates the tide correction of crowdsourced bathymetry (CSB) files
 downloaded from the Internation Hydrographic Organization's (IHO) Data Centre for Digital Bathymetry 
 Crowdsourced Bathymetry Database. 
 
-The raw CSB data is compared totide corrected, and then compared against known bathymetry (in BAG format).
-The mean difference and standard deviation is tabulated for each contirbutor vessel, and any mean difference
-that has a standard deviation less than 1m is used as a vertical static transducer offset value for that vessel.
+The raw CSB data is compared to tide corrected, and then compared against known bathymetry (in BAG format).
+The mean difference and standard deviation is tabulated for each contributor vessel, and any mean difference
+that has a standard deviation less than 2m is used as a vertical static transducer offset value for that vessel.
 Those vertical offsets are applied to the tide-corrected data to create a CSB bathymetry solution.
 
 The output is a shapefile.
