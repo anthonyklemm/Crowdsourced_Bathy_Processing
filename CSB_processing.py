@@ -4,7 +4,7 @@ Created on Mon Dec 28 13:57:44 2020
 Updated 1/27/2023
 
 This script automates the tide correction of crowdsourced bathymetry (CSB) files (in CSV format)
-downloaded from the Internation Hydrographic Organization's (IHO) Data Centre for Digital Bathymetry 
+downloaded from the International Hydrographic Organization's (IHO) Data Centre for Digital Bathymetry 
 Crowdsourced Bathymetry Database. 
 
 The raw CSB data is tide corrected, and then compared against known bathymetry (in BAG format) in a common high-traffic area.
@@ -12,7 +12,7 @@ The mean difference and standard deviation is tabulated for each contirbutor ves
 that has a standard deviation less than 2m is used as a vertical static transducer offset value for that vessel.
 Those vertical offsets are applied to the tide-corrected data to create a CSB bathymetry solution.
 
-The output is a shapefile. Eventually IDW interpolation will be scripted to create a final raster output. 
+The output is a shapefile and a basic geotiff without sophisticated interpolation (recommend changing to IDW). 
 
 
 @author: Anthony Klemm
@@ -25,6 +25,9 @@ import requests
 import os
 from osgeo import gdal
 from rasterstats import point_query
+from functools import partial
+from geocube.api.core import make_geocube
+from geocube.rasterize import rasterize_points_griddata
 
 
 pd.set_option('display.max_columns', None)
@@ -33,6 +36,8 @@ title = 'Toksook_Bay_Alaska_1'
 fp_zones = r"F:\csb\tide zone polygons\tide_zone_polygons_new_WGS84.shp"
 csb = r"F:\csb\Alaska_1.csv"
 BAG_filepath = "F:/csb/comparison data/H12869_MB_4m_MLLW_combined_Alaska_1.bag"
+output_crs="epsg:26903" #change the desired output crs for final raster (recommend NAD83 UTM XX N/S)
+resolution = 50 #desired resolution of output raster in the units of your output_crs (meters or decimal degrees, most likely)
 
 
 print('*****Reading CSB input csv file***** ')
@@ -186,9 +191,22 @@ df = pd.read_csv('E:/CSB_13SEPT2021/VESSEL_OFFSETS_csb_corr_'+ title +'.csv')
 df['std'] = pd.to_numeric(df['std'], errors='coerce').astype('float')
 df['mean'] = pd.to_numeric(df['mean'], errors='coerce').astype('float')
 csb_corr1 = pd.merge(csb_corr, df[df['std'] < 5.0], on='platform')
-csb_corr1['depth_final'] = csb_corr1['depth_new'] - csb_corr1['mean'] #correct csb bathy with transducer offset
+csb_corr1['depth_final'] = ((csb_corr1['depth_new'] - csb_corr1['mean'])*-1) #correct csb bathy with transducer offset
 
 print('*****exporting tide and vessel offset corrected csb to shapefile*****')
 csb_corr1.to_file('F:/csb/results/csb_OFFSETS_APPLIED_'+ title +'.shp', driver='ESRI Shapefile')
 
 print('***** DONE! Thanks for all the CSB! *****')
+
+
+#Rasterize the CSB results and export geotiff depth grid
+
+geo_grid = make_geocube(vector_data=
+    csb_corr1,
+    measurements=["depth_final"],
+    output_crs=output_crs,
+    resolution=((resolution * -1), resolution),
+    )
+    
+geo_grid['depth_final'].plot()
+geo_grid["depth_final"].rio.to_raster('F:/csb/results/csb_OFFSETS_APPLIED_'+ title + ".tif")
