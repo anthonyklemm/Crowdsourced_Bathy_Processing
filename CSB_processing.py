@@ -28,18 +28,20 @@ import os
 from osgeo import gdal
 from rasterstats import point_query
 from geocube.api.core import make_geocube
+import subprocess
+
 
 sg.theme('DarkTeal2')
 if len(sys.argv) == 1:
     event, values = sg.Window('CSB Processing Input Files',
-                    [[sg.Text('Title of CSB Data', size=(35,1)), sg.InputText()],
-                    [sg.Text('EPSG Code for output geotiff CRS', size=(35,1)), sg.InputText()],
+                    [[sg.Text('Title of CSB Data', size=(40,1)), sg.InputText()],
+                    [sg.Text('EPSG Code for projected output geotiff CRS', size=(40,1)), sg.InputText()],
                     [sg.Text('Raw CSB data in *.csv format')],
-                    [sg.In(), sg.FileBrowse()],
+                    [sg.In(), sg.FileBrowse(file_types=(('CSV file', '*.csv'),))],
                     [sg.Text('Input BAG file for comparison bathymetry')],
-                    [sg.In(), sg.FileBrowse()],
+                    [sg.In(), sg.FileBrowse(file_types=(('BAG file', '*.bag'),))],
                     [sg.Text('Tide Zone file in *.shp format')],
-                    [sg.In(), sg.FileBrowse()],
+                    [sg.In(), sg.FileBrowse(file_types=(('Shapefile', '*.shp'),))],
                     [sg.Text('Specify output folder')],
                     [sg.In(), sg.FolderBrowse()],
                     [sg.Open(), sg.Cancel()]]).read(close=True)
@@ -122,7 +124,6 @@ def tides():
     new_df['max'] = new_df['max'].dt.strftime("%Y%m%d %H:%M")
     new_df = new_df.reset_index()
     new_df = new_df.astype({'ControlStn':'str'})
-    print(new_df)
     print('*****retrieving tide data from NOAA COOPS API*****')
     
     tdf = []
@@ -151,7 +152,6 @@ def tides():
         tdf = pd.concat(tdf)
     except Exception:
         pass
-    print(tdf)
     tdf = tdf.sort_values('t')
     join = join.sort_values('time')
           
@@ -180,7 +180,6 @@ def tides():
     csb_corr = csb_corr[csb_corr['depth'] < 1000]
     csb_corr = csb_corr.rename(columns={'depth':'depth_old'})
     csb_corr = csb_corr.drop(columns=['index_right','ATCorr','RR','ATCorr2','RR2','DataProv','Shape_Leng','Shape_Area','Shape_Le_1','t','v','t_corr','t_new','v_new'])
-    print(csb_corr)
     return csb_corr
 
 def BAGextract():
@@ -255,6 +254,8 @@ def rasterize_CSB():
         
     geo_grid['depth_final'].plot()
     geo_grid["depth_final"].rio.to_raster(output_dir + '/csb_OFFSETS_APPLIED_'+ title + '.tif')
+    mod_output_dir = output_dir.replace("/", "\\")
+    subprocess.Popen(r'explorer "'+ mod_output_dir)
     
     print('***** DONE! Thanks for all the CSB! *****')
 
