@@ -1,78 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Dec 28 13:57:44 2020
-Updated 11/13/2023
+Created on Mon Nov 20 14:51:41 2023
 
-This script automates the tide correction of crowdsourced bathymetry (CSB) files (in CSV format)
-downloaded from the International Hydrographic Organization's (IHO) Data Centre for Digital Bathymetry 
-Crowdsourced Bathymetry Database. 
-
-The raw CSB data is tide corrected using a discrete zoned tides model, and then compared against known 
-bathymetry (in BAG format) in a common high-traffic area.
-The mean difference and standard deviation is tabulated for each contributor vessel, and any mean difference
-that has a standard deviation less than 2m is used as a vertical static transducer offset value for that vessel.
-Those vertical offsets are applied to the tide-corrected data to create a CSB bathymetry solution.
-
-The output is a shapefile and a basic geotiff without sophisticated interpolation (recommend changing to IDW). 
-The next development step is to compile the script as a standalone executable. 
-
-@author: Anthony Klemm
+@author: anthonyklemm
 """
 
-import PySimpleGUI as sg
+import tkinter as tk
+from tkinter import filedialog
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 import requests
-import sys
 import os
-from osgeo import gdal, ogr, osr
-from rasterstats import point_query
-from geocube.api.core import make_geocube
+from osgeo import gdal
 import subprocess
-import time
 import rasterio
-from rasterio.features import shapes
+from rasterio.features import shapes, rasterize
 from shapely.geometry import shape
-from shapely.ops import unary_union
 from scipy.ndimage import binary_dilation
+from rasterio.transform import from_origin
+import matplotlib.pyplot as plt
+from rasterio.plot import show
+import time
 
 
 
-sg.theme('DarkTeal2')
-if len(sys.argv) == 1:
-    event, values = sg.Window('CSB Processing Input Files',
-                    [[sg.Text('Title of CSB Data', size=(40,1)), sg.InputText()],
-                    [sg.Text('EPSG Code for projected output geotiff CRS', size=(40,1)), sg.InputText()],
-                    [sg.Text('Raw CSB data in *.csv format')],
-                    [sg.In(), sg.FileBrowse(file_types=(('CSV file', '*.csv'),))],
-                    [sg.Text('Input BAG file for comparison bathymetry')],
-                    [sg.In(), sg.FileBrowse(file_types=(('BAG file', '*.bag'),))],
-                    [sg.Text('Tide Zone file in *.shp format')],
-                    [sg.In(), sg.FileBrowse(file_types=(('Shapefile', '*.shp'),))],
-                    [sg.Text('Specify output folder')],
-                    [sg.In(), sg.FolderBrowse()],
-                    [sg.Open(), sg.Cancel()]]).read(close=True)
-    
-    title = values[0]
-    output_crs = "epsg:"+values[1]
-    csb = values[2]
-    BAG_filepath = values[3]
-    fp_zones = values[4]
-    output_dir = values[5]
-else:
-    csb = sys.argv[1]
-
-if not csb:
-    sg.popup("Cancel", "No filename for csb raw file supplied")
-    raise SystemExit("Cancelling: no filename supplied")
-else:
-    sg.popup('The CSB filename you chose was', csb)
-    start_time = time.time()
-
+# Global variables
+title = ""
+#output_crs = ""
+csb = ""
+BAG_filepath = ""
+fp_zones = ""
+output_dir = ""
+resolution = 50 # resolution of quick-look geotiff raster
 
 pd.set_option('display.max_columns', None)
-resolution = 50 #desired resolution of output raster in the units of your output_crs (meters or decimal degrees, most likely)
 
 def loadCSB():
 
@@ -88,13 +50,12 @@ def loadCSB():
     df2 = df2.astype({'time':'datetime64'}, errors='ignore')
     df2 = df2.dropna(subset=['time'])
     df2 = df2[df2['time'] > '2014']
-    df2 = df2[df2['time'] < '2024']
+    df2 = df2[df2['time'] < '2025']
     
     df2 = df2.drop_duplicates(subset=['lon', 'lat', 'depth', 'time', 'unique_id'])
     gdf = gpd.GeoDataFrame(df2, geometry=gpd.points_from_xy(df2.lon, df2.lat)) #create vector point file from lat and lon
     gdf = gdf.set_crs(4326, allow_override=True)
     return gdf
-    
     
 def tides():      
     gdf = loadCSB()
@@ -148,11 +109,7 @@ def tides():
             print(URL_API)
             response = requests.get(URL_API)
             json_dict = response.json()
-            #print(json_dict)
-            #export out as individual json files of the reference tide station data
-            #out_file = open("E:/csb/jsondump1/"+'8770733'+'.json', 'w')
-            #json.dump(json_dict, out_file, indent = 6)
-            #out_file.close()
+
         except Exception:
                 continue
         try:
@@ -198,10 +155,21 @@ def tides():
     return csb_corr
 
 def BAGextract():
+    print("DEBUG - BAG_filepath:", BAG_filepath)  # Debug print
     print('*****Starting to import BAG bathy and aggregate to 8m geotiff*****')
-    # Converting BAG to geotiff and extracting the elevation layer
     dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
-    gdal.Translate(output_dir + '/' + title + '.tif', dataset)  # converts BAG to dual band geotiff
+    if dataset is None:
+        print("Error: Unable to open the BAG file. Check the file path.")
+        return None, None  # Return early to avoid further processing
+
+    
+    # Specify the options for gdal.Translate
+    translate_options = gdal.TranslateOptions(bandList=[1],  # Use only the first band
+                                              creationOptions=['COMPRESS=LZW'])  # Apply LZW compression
+
+    # Create a single-band GeoTIFF with LZW compression
+    gdal.Translate(output_dir + '/' + title + '.tif', dataset, options=translate_options)
+
     dataset = None
 
     dsReprj = gdal.Warp(output_dir + '/' + title + '_5m_MLLW.tif', output_dir + '/' + title + '.tif', xRes=8, yRes=8)  # resamples to chosen raster resolution
@@ -255,12 +223,31 @@ def BAGextract():
     print('Bathymetry polygon shapefile created.')
     return output_raster, bathy_polygon_shp
 
+def get_raster_value(x, y, raster):
+    """ Get the value of the raster at the specified coordinates """
+    ds = gdal.Open(raster)
+    gt = ds.GetGeoTransform()
+    rb = ds.GetRasterBand(1)
+    nodata = rb.GetNoDataValue()
+
+    px = int((x - gt[0]) / gt[1])
+    py = int((y - gt[3]) / gt[5])
+
+    if px < 0 or py < 0 or px >= ds.RasterXSize or py >= ds.RasterYSize:
+        return np.nan  # Point is outside the raster
+
+    value = rb.ReadAsArray(px, py, 1, 1)[0][0]
+
+    if value == nodata:
+        return np.nan  # Handle nodata values
+
+    return value
+
 def derive_draft():
     output_raster, raster_boundary_shp = BAGextract()
     csb_corr = tides()
 
     print('*****Starting derive_draft function*****')
-    
     
     # Load the raster boundary as a GeoDataFrame
     raster_boundary = gpd.read_file(raster_boundary_shp)
@@ -269,14 +256,6 @@ def derive_draft():
     raster_boundary['geometry'] = raster_boundary['geometry'].apply(lambda geom: geom if geom.is_valid else geom.buffer(0))
     csb_corr['geometry'] = csb_corr['geometry'].apply(lambda geom: geom if geom.is_valid else geom.buffer(0))
 
-    # Remove any null geometries
-    raster_boundary = raster_boundary[raster_boundary['geometry'].notnull()]
-    #csb_corr = csb_corr[csb_corr['geometry'].notnull()]
-
-    print('Performing the spatial join to create a subset')
-    #csb_corr_subset = csb_corr[csb_corr.geometry.within(raster_boundary.geometry.unary_union)]
-
-
     # Assign a unique row identifier to the original dataframe
     csb_corr['row_id'] = range(len(csb_corr))
 
@@ -284,13 +263,13 @@ def derive_draft():
     csb_corr_subset = csb_corr[csb_corr.geometry.within(raster_boundary.geometry.unary_union)]
 
     print('Performing the raster depth extraction with the subset')
-    pts = point_query(csb_corr_subset, output_raster)
 
-    # Add the results to the subset
-    csb_corr_subset["Raster_Value"] = pts
+    # Extract raster values for each point in the subset
+    csb_corr_subset['Raster_Value'] = csb_corr_subset.apply(
+        lambda row: get_raster_value(row.geometry.x, row.geometry.y, output_raster), axis=1
+    )
 
     # Merge the results back into the original dataframe
-    # We will use a left merge to ensure all original records in csb_corr are preserved
     csb_corr = csb_corr.merge(csb_corr_subset[['row_id', 'Raster_Value']], on='row_id', how='left')
 
     # Calculate the depth difference with the merged data
@@ -319,31 +298,155 @@ def draft_corr():
     print('*****exporting tide and vessel offset corrected csb to shapefile*****')
     csb_corr1.to_file(output_dir + '/csb_OFFSETS_APPLIED_'+ title +'.shp', driver='ESRI Shapefile')
     return(csb_corr1)
-    
-def rasterize_CSB():    
-    #Rasterize the CSB results and export geotiff depth grid
-    csb_corr1=draft_corr()
-    print('*****rasterizing CSB data and exporting geotiff*****')
 
-    geo_grid = make_geocube(vector_data=
-        csb_corr1,
-        measurements=["depth_final"],
-        output_crs=output_crs,
-        resolution=((resolution * -1), resolution),
-        )
+def reproject_to_mercator(geodataframe):
+    # Reproject to EPSG:3395 (World Mercator)
+    return geodataframe.to_crs(epsg=3395)
+
+def rasterize_with_rasterio(geodataframe, output_path, resolution=50, nodatavalue=1000000):
+    # Reproject the geodataframe
+    geodataframe = reproject_to_mercator(geodataframe)
+
+    # Debugging steps: Check if the GeoDataFrame is empty
+    if geodataframe.empty:
+        print("Error: The GeoDataFrame is empty.")
+        return
+    else:
+        print(f"Number of features in the GeoDataFrame: {len(geodataframe)}")
+        print(geodataframe.head())
+
+    # Define the bounds of your raster
+    minx, miny, maxx, maxy = geodataframe.total_bounds
+    print("Spatial extent:", minx, miny, maxx, maxy)
+
+    # Check if bounds are reasonable
+    if (maxx-minx) <= 0 or (maxy-miny) <= 0:
+        print("Error: Invalid spatial extent.")
+        return
+
+    # Calculate the dimensions of the raster
+    x_res = int((maxx - minx) / resolution)
+    y_res = int((maxy - miny) / resolution)
+
+    # Debugging step: Check if resolution is leading to zero dimensions
+    if x_res <= 0 or y_res <= 0:
+        print("Error: Resolution too high or invalid spatial extent, leading to zero dimensions.")
+        return
+
+    # Define the transform
+    transform = from_origin(minx, maxy, resolution, resolution)
+
+    # Define the output raster dimensions and CRS
+    out_meta = {
+        'driver': 'GTiff',
+        'height': y_res,
+        'width': x_res,
+        'count': 1,
+        'dtype': 'float32',
+        'crs': geodataframe.crs.to_string(),
+        'transform': transform,
+        'nodata': nodatavalue
+    }
+
+    # Rasterize the geometries
+    with rasterio.open(output_path, 'w', **out_meta) as out_raster:
+        out_raster.write(rasterize(
+            ((geom, value) for geom, value in zip(geodataframe.geometry, geodataframe['depth_final'])),
+            out_shape=(y_res, x_res),
+            transform=transform,
+            fill=nodatavalue
+        ), 1)
         
-    geo_grid['depth_final'].plot()
-    geo_grid["depth_final"].rio.to_raster(output_dir + '/csb_OFFSETS_APPLIED_'+ title + '.tif')
+def rasterize_CSB():
+    csb_corr1 = draft_corr()
+    print('*****Rasterizing CSB data and exporting geotiff*****')
+    output_raster_path = output_dir + '/csb_OFFSETS_APPLIED_' + title + '.tif'
+    rasterize_with_rasterio(csb_corr1, output_raster_path, resolution)    
+
+    with rasterio.open(output_raster_path) as src:
+        fig, ax = plt.subplots()
+        show(src, ax=ax, title='CSB Raster')
+        plt.show()
+        
+    # Open explorer window of CSB processing results
     mod_output_dir = output_dir.replace("/", "\\")
     subprocess.Popen(r'explorer "'+ mod_output_dir)
-    end_time = time.time()
-    execution_time = end_time - start_time
-    
 
+def open_file_dialog(var, file_types):
+    filename = filedialog.askopenfilename(filetypes=file_types)
+    var.set(filename)
 
-    print('***** DONE! Thanks for all the CSB! *****')
-    print(f"Total execution time: {execution_time} seconds")
+def open_folder_dialog(var):
+    foldername = filedialog.askdirectory()
+    var.set(foldername)
 
-if __name__ == "__main__":
+def process_csb():
+    start_time = time.time()  # Start the timer
+    print("Processing...")
+    global title, output_crs, csb, BAG_filepath, fp_zones, output_dir
+
+    # Update global variables
+    title = title_var.get()
+    #output_crs = output_crs_var.get()
+    csb = csb_var.get()
+    BAG_filepath = BAG_filepath_var.get()
+    fp_zones = fp_zones_var.get()
+    output_dir = output_dir_var.get()
+
+    # Call the main processing function
     rasterize_CSB()
     
+    end_time = time.time()  # End the timer
+    duration = end_time - start_time
+    minutes, seconds = divmod(duration, 60)
+    print(f"***** DONE! Thanks for all the CSB! *****\nTotal processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
+
+# Tkinter GUI setup
+root = tk.Tk()
+root.title("CSB Processing Input Files")
+
+# Global variables as StringVar
+title_var = tk.StringVar()
+#output_crs_var = tk.StringVar()
+csb_var = tk.StringVar()
+BAG_filepath_var = tk.StringVar()
+fp_zones_var = tk.StringVar()
+output_dir_var = tk.StringVar()
+
+# Layout and widgets
+tk.Label(root, text='Title of CSB Data').grid(row=0, column=0, sticky='w')
+title_entry = tk.Entry(root, textvariable=title_var)
+title_entry.grid(row=0, column=1)
+
+title_entry = tk.Entry(root, textvariable=title_var)
+
+#button if you want to specify EPSG code for output geotiff instead of using hardcoded 3395
+#tk.Label(root, text='EPSG Code for projected output geotiff CRS').grid(row=1, column=0, sticky='w')
+#output_crs_entry = tk.Entry(root, textvariable = output_crs_var)
+#output_crs_entry.grid(row=1, column=1)
+
+tk.Label(root, text='Raw CSB data in *.csv format').grid(row=1, column=0, sticky='w')
+csb_entry = tk.Entry(root, textvariable= csb_var)
+csb_entry.grid(row=1, column=1)
+tk.Button(root, text='Browse', command=lambda: open_file_dialog(csb_var, [("CSV file", "*.csv")])).grid(row=1, column=2)
+
+tk.Label(root, text='Input BAG file for comparison bathymetry').grid(row=2, column=0, sticky='w')
+BAG_filepath_entry = tk.Entry(root, textvariable= BAG_filepath_var)
+BAG_filepath_entry.grid(row=2, column=1)
+tk.Button(root, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG file", "*.bag")])).grid(row=2, column=2)
+
+tk.Label(root, text='Tide Zone file in *.shp format').grid(row=3, column=0, sticky='w')
+fp_zones_entry = tk.Entry(root, textvariable= fp_zones_var)
+fp_zones_entry.grid(row=3, column=1)
+tk.Button(root, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=3, column=2)
+
+tk.Label(root, text='Specify output folder').grid(row=4, column=0, sticky='w')
+output_dir_entry = tk.Entry(root, textvariable=output_dir_var)
+output_dir_entry.grid(row=4, column=1)
+tk.Button(root, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=4, column=2)
+
+
+tk.Button(root, text='Process', command=process_csb).grid(row=5, column=1, sticky='e')
+
+if __name__ == "__main__":
+    root.mainloop()
