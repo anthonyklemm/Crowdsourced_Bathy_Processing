@@ -15,13 +15,20 @@ import os
 from osgeo import gdal
 import subprocess
 import rasterio
+from scipy.interpolate import interp1d
 from rasterio.features import shapes, rasterize
 from shapely.geometry import shape
-from scipy.ndimage import binary_dilation
 from rasterio.transform import from_origin
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from rasterio.plot import show
 import time
+import threading
+from rasterio.merge import merge
+from rasterio.enums import Resampling
+from shapely.ops import unary_union
+from skimage.morphology import binary_dilation, binary_erosion
 
 
 
@@ -32,7 +39,7 @@ csb = ""
 BAG_filepath = ""
 fp_zones = ""
 output_dir = ""
-resolution = 50 # resolution of quick-look geotiff raster
+resolution = 20 # resolution of quick-look geotiff raster
 
 pd.set_option('display.max_columns', None)
 
@@ -40,8 +47,7 @@ def loadCSB():
 
     print('*****Reading CSB input csv file***** ')
     df1=gpd.read_file(csb) #read in CSB data in CSV
-    #df1=df[df['platform_name'] != "Anonymous"] #filter out "Anonymous" vessels (can't do a vessel by vessel offset comparison against valid data)
-    #Data cleaning = make sure dates are correct
+    #df1 = df1.head(20000)  # Limit to top 2000 records for debugging
     
     df1 = df1.astype({'depth' : 'float'}) #turn depth field numeric (float64)
     df2 = df1[df1['depth'] > .5] #remove depth values less that 1.2m (filtering out probable noise)
@@ -56,29 +62,208 @@ def loadCSB():
     gdf = gpd.GeoDataFrame(df2, geometry=gpd.points_from_xy(df2.lon, df2.lat)) #create vector point file from lat and lon
     gdf = gdf.set_crs(4326, allow_override=True)
     return gdf
+
+def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetopo=True):
+    # Load CSB data
+    csb_data = pd.read_csv(csb_data_path)
+    gdf = gpd.GeoDataFrame(csb_data, geometry=gpd.points_from_xy(csb_data.lon, csb_data.lat))
+    gdf = gdf.set_crs(4326, allow_override=True)
+
+
+    # Create convex hull
+    convex_hull_polygon = gdf.unary_union.convex_hull
+    convex_hull_gdf = gpd.GeoDataFrame(geometry=[convex_hull_polygon], crs=gdf.crs)
+
+    # Export to shapefile
+    convex_hull_shapefile = os.path.join(output_dir, "convex_hull_polygon.shp")
+    convex_hull_gdf.to_file(convex_hull_shapefile)
+
+    if use_bluetopo:
+        # Define a dedicated directory for BlueTopo tiles with the project title
+        bluetopo_tiles_dir = os.path.join(output_dir, title, "Modeling")
+
+        # Ensure the directory exists
+        os.makedirs(bluetopo_tiles_dir, exist_ok=True)
+
+        # Download BlueTopo tiles to the dedicated directory
+        from nbs.bluetopo import fetch_tiles
+        fetch_tiles(bluetopo_tiles_dir, convex_hull_shapefile, data_source='modeling')
+
+        # Mosaic downloaded tiles using the new directory
+        return mosaic_tiles(bluetopo_tiles_dir) 
+
+def mosaic_tiles(tiles_dir):
+    # Directory where the tiles are stored is now passed as a parameter
+    mosaic_raster_path = os.path.join(tiles_dir, 'merged_tiles.tif')
+
+    # List to store the opened rasters
+    raster_list = []
+
+    # Recursively search for geotiff files within the tiles_dir and open them
+    for root, dirs, files in os.walk(tiles_dir):
+        for file in files:
+            if file.endswith('.tiff'):
+                raster_path = os.path.join(root, file)
+                src = rasterio.open(raster_path)
+                raster_list.append(src)
+
+    # Merge the rasters using only the first band
+    merged_raster, out_transform = merge(raster_list)
+
+    # Write the merged raster
+    out_meta = src.meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": merged_raster.shape[1],
+        "width": merged_raster.shape[2],
+        "transform": out_transform,
+        "count": 1  # Only one band
+    })
+
+    with rasterio.open(mosaic_raster_path, "w", **out_meta) as dest:
+        dest.write(merged_raster[0, :, :], 1)  # Write only the first band
+
+    # Close the opened rasters
+    for src in raster_list:
+        src.close()
+
+    return mosaic_raster_path
+
+
+
+def fetch_tide_data(station_id, start_date, end_date, interval=None):
+    base_url = "https://tidesandcurrents.noaa.gov/api/datagetter"
+    params = {
+        "begin_date": start_date,
+        "end_date": end_date,
+        "station": station_id,
+        "product": "predictions",
+        "datum": "MLLW",
+        "time_zone": "gmt",
+        "units": "metric",
+        "application": "NOAA_Coast_Survey",
+        "format": "json"
+    }
+    if interval == 'hilo':
+        params["interval"] = interval
+
+    # Construct the URL for debugging
+    request_url = requests.Request('GET', base_url, params=params).prepare().url
+    print(f"Requesting URL: {request_url}")  # Print the URL
+
+    # Make the request
+    response = requests.get(request_url)
+    data = response.json()
+
+    if 'predictions' in data:
+        df = pd.json_normalize(data['predictions'])
+        if 't' in df.columns and 'v' in df.columns:
+            df['v'] = df['v'].astype(float)
+            df['t'] = pd.to_datetime(df['t'])
+            return df
+        else:
+            print(f"Warning: Missing 't' or 'v' column in response for station {station_id}.")
+            return pd.DataFrame()
+    else:
+        print(f"Warning: No 'predictions' in response for station {station_id}.")
+        return pd.DataFrame()
+
+
+def cosine_interpolation(df, start_date, end_date):
+    df['time_num'] = (df['t'] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
+    df = df.sort_values('time_num')
+    interp_func = interp1d(df['time_num'], df['v'], kind='cubic')
+    time_num_grid = np.linspace(df['time_num'].min(), df['time_num'].max(), num=3000)
+    v_grid = interp_func(time_num_grid)
+    time_grid = pd.to_datetime(time_num_grid, unit='s')
     
+    # Trimming
+    trim_start = pd.to_datetime(start_date) + pd.Timedelta(hours=12)
+    trim_end = pd.to_datetime(end_date) - pd.Timedelta(hours=12)
+    trimmed_df = pd.DataFrame({'t': time_grid, 'v': v_grid})
+    trimmed_df = trimmed_df[(trimmed_df['t'] >= trim_start) & (trimmed_df['t'] <= trim_end)]
+    #print(trimmed_df)
+    return trimmed_df
+
+def create_survey_outline(raster_path, output_dir, title, desired_resolution=8, dilation_iterations=3, erosion_iterations=2):
+    with rasterio.open(raster_path) as raster:
+        # Resample the raster
+        data = raster.read(
+            1,  # Reading only the first band
+            out_shape=(
+                raster.height // desired_resolution,
+                raster.width // desired_resolution
+            ),
+            resampling=Resampling.bilinear
+        )
+
+        # Create a binary mask
+        nodata = raster.nodatavals[0] or 1000000
+        binary_mask = (data != nodata).astype(np.uint8)
+
+        # Apply dilation and erosion
+        for _ in range(dilation_iterations):
+            binary_mask = binary_dilation(binary_mask)
+        for _ in range(erosion_iterations):
+            binary_mask = binary_erosion(binary_mask)
+
+        # Ensure binary_mask is of type uint8
+        binary_mask = binary_mask.astype(np.uint8)
+
+        # Generate shapes from the binary mask
+        transform = raster.transform * raster.transform.scale(
+            (raster.width / data.shape[-1]),
+            (raster.height / data.shape[-2])
+        )
+
+        polygons = [shape(geom) for geom, val in shapes(binary_mask, mask=binary_mask, transform=transform) if val == 1]
+
+        # Perform unary union
+        unified_geometry = unary_union(polygons)
+
+        # Reproject unified geometry to WGS84 before simplification
+        geo_df = gpd.GeoDataFrame(geometry=[unified_geometry], crs=raster.crs)
+        geo_df = geo_df.to_crs(epsg=4326)
+
+        # Simplify the geometry
+        geo_df['geometry'] = geo_df.geometry.simplify(tolerance=0.001)
+
+        # Check and fix bad topology if necessary
+        geo_df['geometry'] = geo_df.geometry.apply(lambda geom: geom.buffer(0) if not geom.is_valid else geom)
+
+        # Save to a shapefile
+        bathy_polygon_shp = f"{output_dir}/{title}_bathy_polygon.shp"
+        geo_df.to_file(bathy_polygon_shp, driver='ESRI Shapefile')
+
+        print('Bathymetry polygon shapefile created.')
+        return bathy_polygon_shp
+
+
 def tides():      
     gdf = loadCSB()
     print('CSB data from csv file loaded. Starting tide correction')
 
-    zones=gpd.read_file(fp_zones)
+    zones = gpd.read_file(fp_zones)
     join = gpd.sjoin(gdf, zones, how='inner', predicate='within')
     join = join.astype({'time':'datetime64'})
-    #print(join)
-    
+
+    # Sort the join DataFrame by 'time' column
+    join = join.sort_values('time')
+
     ts = join.groupby('ControlStn').agg(['min','max'])
     ts = ts['time']
     ts = ts.reset_index(drop=False)
     
-    
+    # Filter out non-numeric ControlStn values
+    ts = ts[ts['ControlStn'].str.match(r'^\d+$')]  # Keep only rows where ControlStn is numeric
+
     #format timestamps for NOAA CO-OPS Tidal Data API
     ts['min'] = ts['min'].dt.strftime("%Y%m%d %H:%M")
     ts['max'] = ts['max'].dt.strftime("%Y%m%d %H:%M")
     ts = ts.astype({'min': 'datetime64'})
     ts = ts.astype({'max': 'datetime64'})
     ts = ts.astype({'ControlStn':'int32'})
-    
-    
+
     ts.rename(columns = {'min':'StartDate', 'max':'EndDate'}, inplace=True)
     print(ts)
     ts = ts.set_index('StartDate')
@@ -93,7 +278,7 @@ def tides():
         new_df = pd.concat([new_df, data])
     
     new_df = new_df[['ControlStn','StartDate', 'EndDate']]
-    
+
     new_df.rename(columns = {'StartDate':'min','EndDate': 'max'}, inplace=True)
     new_df['min'] = new_df['min'].dt.strftime("%Y%m%d %H:%M")
     new_df['max'] = new_df['max'].dt.strftime("%Y%m%d %H:%M")
@@ -101,127 +286,151 @@ def tides():
     new_df = new_df.astype({'ControlStn':'str'})
     print('*****retrieving tide data from NOAA COOPS API*****')
     
+    # Keep track of subordinate stations
+    subordinate_stations = set()
+    
     tdf = []
     for ind in new_df.index:
-        try:
+        station_id = new_df['ControlStn'][ind]
         
-            URL_API = 'https://tidesandcurrents.noaa.gov/api/datagetter?begin_date='+new_df['min'][ind]+'&end_date='+new_df['max'][ind]+'&station='+new_df['ControlStn'][ind]+'&product=predictions&datum=mllw&units=metric&time_zone=gmt&application=NOAA_Coast_Survey&format=json'
-            print(URL_API)
-            response = requests.get(URL_API)
-            json_dict = response.json()
-
-        except Exception:
+        # Skip the 6-minute prediction attempt if the station is already known to be subordinate
+        if station_id not in subordinate_stations:
+            min_predictions = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind])
+            if not min_predictions.empty:
+                tdf.append(min_predictions)
                 continue
-        try:
-            data = pd.json_normalize(json_dict["predictions"])
-            data[['v']] = data[['v']].apply(pd.to_numeric)
-            data = data.astype({'t':'datetime64'})
-            tdf.append(data)
-        except Exception:
-            continue
-    try:
+    
+        # Fetch high-low data and interpolate for subordinate stations
+        print(f"Control station {station_id} is subordinate... fetching high & low tide values and performing cosine interpolation")
+        hilo_predictions = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind], interval='hilo')
+        if not hilo_predictions.empty:
+            interpolated_hilo = cosine_interpolation(hilo_predictions, new_df['min'][ind], new_df['max'][ind])
+            tdf.append(interpolated_hilo)
+        else:
+            print(f"Skipping interpolation for station {station_id} due to missing data.")
+        # Add the station to the list of known subordinate stations
+        subordinate_stations.add(station_id)
+    
+    '''
+    tdf = []
+    for ind in new_df.index:
+        # First, try to fetch 6-minute predictions
+        min_predictions = fetch_tide_data(new_df['ControlStn'][ind], new_df['min'][ind], new_df['max'][ind])
+        if not min_predictions.empty:
+            tdf.append(min_predictions)
+        else:
+            # If 6-minute predictions are not available, fetch high-low data and interpolate
+            print("this control station is a subordinate... fetching high & low tide values and performing cosine interpolation")
+            hilo_predictions = fetch_tide_data(new_df['ControlStn'][ind], new_df['min'][ind], new_df['max'][ind], interval='hilo')
+            interpolated_hilo = cosine_interpolation(hilo_predictions, new_df['min'][ind], new_df['max'][ind])
+            tdf.append(interpolated_hilo)
+            '''
+    if tdf:
         tdf = pd.concat(tdf)
-    except Exception:
-        pass
-    tdf = tdf.sort_values('t')
-    join = join.sort_values('time')
-          
-    jtdf = pd.merge_asof(join, tdf, left_on='time', right_on='t')
-    jtdf = jtdf.drop(columns=['ControlS_1'])
-    jtdf = jtdf.drop(columns=['ControlS_2'])
-    jtdf = jtdf.drop(columns=['DataProv'])
-    jtdf = jtdf.dropna()
-    jtdf['t_corr'] = jtdf['t'] + pd.to_timedelta(jtdf['ATCorr'], unit='m')
+        print("Concatenated tdf shape:", tdf.shape)
+        
+        tdf = tdf.sort_values('t')
+        jtdf = pd.merge_asof(join, tdf, left_on='time', right_on='t')
+        print("jtdf shape before column drop:", jtdf.shape)
     
+        # Dropping unneeded columns
+        columns_to_drop = ['Shape__Are', 'Shape__Len', 'Input_FID', 'id', 'name', 'state', 'affil', 
+                           'latitude', 'longitude', 'data', 'metaapi', 'dataapi', 'Shape_Le_2']
+        jtdf.drop(columns=columns_to_drop, inplace=True, errors='ignore')
+        print("jtdf shape after column drop:", jtdf.shape)
     
+        # Check NaN values after dropping columns
+        #print("NaN values in jtdf:", jtdf.isna().sum())
     
-    newdf = jtdf[['t_corr','v']].copy()
-    newdf = newdf.rename(columns={'v':'v_new', 't_corr':'t_new'})
-    newdf = newdf.sort_values('t_new')
-    newdf = newdf.dropna() 
-    
-    csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new', direction='nearest')
-    csb_corr = csb_corr.dropna()
-    
-    csb_corr['depth_new'] = csb_corr['depth'] - (csb_corr['RR'] * csb_corr['v_new'])                
-    csb_corr = gpd.GeoDataFrame(csb_corr, geometry='geometry', crs='EPSG:4326')
-    csb_corr['time'] = csb_corr['time'].dt.strftime("%Y%m%d %H:%M:%S")
-    
-    #filter out depths less than 1.5m and greater than 1000m
-    csb_corr = csb_corr[csb_corr['depth'] > 1.5]
-    csb_corr = csb_corr[csb_corr['depth'] < 1000]
-    csb_corr = csb_corr.rename(columns={'depth':'depth_old'})
-    csb_corr = csb_corr.drop(columns=['index_right','ATCorr','RR','ATCorr2','RR2','Shape_Leng','Shape_Area','Shape_Le_1','t','v','t_corr','t_new','v_new'])
-    return csb_corr
+        # Drop rows based on NaNs in critical columns
+        jtdf = jtdf.dropna(subset=['depth', 'time', 'geometry'])  # Assuming these are critical
+        print("jtdf shape after dropna:", jtdf.shape)
+        
+        jtdf['t_corr'] = jtdf['t'] + pd.to_timedelta(jtdf['ATCorr'], unit='m')
+
+        newdf = jtdf[['t_corr','v']].copy()
+        print("newdf shape before dropna:", newdf.shape)
+
+        newdf = newdf.rename(columns={'v':'v_new', 't_corr':'t_new'})
+        newdf = newdf.sort_values('t_new').dropna()
+        print("newdf shape after dropna:", newdf.shape)
+
+        csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new', direction='nearest')
+        print("csb_corr shape before dropna:", csb_corr.shape)
+
+        #csb_corr = csb_corr.dropna()
+        print("csb_corr shape after dropna:", csb_corr.shape)
+
+        csb_corr['depth_new'] = csb_corr['depth'] - (csb_corr['RR'] * csb_corr['v_new'])   
+        print("csb_corr shape after applying tide corrections:", csb_corr.shape)
+             
+        csb_corr = gpd.GeoDataFrame(csb_corr, geometry='geometry', crs='EPSG:4326')
+        csb_corr['time'] = csb_corr['time'].dt.strftime("%Y%m%d %H:%M:%S")
+        
+        # Filter out depths
+        csb_corr = csb_corr[(csb_corr['depth'] > 1.5) & (csb_corr['depth'] < 1000)]
+        csb_corr = csb_corr.rename(columns={'depth':'depth_old'}).drop(columns=['index_right', 'ATCorr', 'RR', 'ATCorr2', 'RR2', 'Shape_Leng', 'Shape_Area', 'Shape_Le_1', 't', 'v', 't_corr', 't_new', 'v_new'])
+        #print(csb_corr)
+        return csb_corr
+    else:
+        print("No tide data available for the specified period.")
+        return pd.DataFrame()
+
 
 def BAGextract():
-    print("DEBUG - BAG_filepath:", BAG_filepath)  # Debug print
+    print("DEBUG - BAG_filepath:", BAG_filepath)
     print('*****Starting to import BAG bathy and aggregate to 8m geotiff*****')
-    dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
-    if dataset is None:
-        print("Error: Unable to open the BAG file. Check the file path.")
-        return None, None  # Return early to avoid further processing
+    file_extension = os.path.splitext(BAG_filepath)[1].lower()
 
-    
-    # Specify the options for gdal.Translate
-    translate_options = gdal.TranslateOptions(bandList=[1],  # Use only the first band
-                                              creationOptions=['COMPRESS=LZW'])  # Apply LZW compression
+    output_raster = output_dir + '/' + title + '_MB_5m_elevation__.tif'
 
-    # Create a single-band GeoTIFF with LZW compression
-    gdal.Translate(output_dir + '/' + title + '.tif', dataset, options=translate_options)
+    # Open and process the dataset
+    if file_extension in ['.bag', '.tif', '.tiff']:
+        dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
+        if dataset is None:
+            print("Error: Unable to open the file. Check the file path.")
+            return None, None
+    else:
+        print("Error: Unsupported file format.")
+        return None, None
 
+    # Translate options and creation of single-band GeoTIFF
+    translate_options = gdal.TranslateOptions(bandList=[1], creationOptions=['COMPRESS=LZW'])
+    intermediate_raster_path = output_dir + '/' + title + '_intermediate.tif'
+    gdal.Translate(intermediate_raster_path, dataset, options=translate_options)
     dataset = None
 
-    dsReprj = gdal.Warp(output_dir + '/' + title + '_5m_MLLW.tif', output_dir + '/' + title + '.tif', xRes=8, yRes=8)  # resamples to chosen raster resolution
-    dsReprj = None
+    # Resample to desired resolution
+    output_raster_resampled = output_dir + '/' + title + '_5m_MLLW.tif'
+    gdal.Warp(output_raster_resampled, intermediate_raster_path, xRes=8, yRes=8)
 
-    str1 = "gdal_translate -b 1 -of AAIGrid " + output_dir + '/' + title + '_5m_MLLW.tif ' + output_dir + '/' + title + '_MB_5m_elevation.tif'
-    os.system(str1)  # extracts the elevation band and saves as new geotiff
+    # Replace NaN values and update nodata value in the raster
+    with rasterio.open(output_raster_resampled) as src:
+        data = src.read(1)
+        meta = src.meta
 
-    raster_file = output_dir + '/' + title + '_MB_5m_elevation.tif'
-    input_raster = gdal.Open(raster_file)
-    output_raster = output_dir + '/' + title + '_MB_5m_elevation_wgs84.tif'
-    warp = gdal.Warp(output_raster, input_raster, dstSRS='EPSG:4326')
-    raster_file = None
-    input_raster = None
-    warp = None
+    data = np.where(np.isnan(data), 1000000, data)
+    meta.update(nodata=1000000)
 
-    os.remove(output_dir + '/' + title + '_5m_MLLW.tif')
-    os.remove(output_dir + '/' + title + '.tif')
-    os.remove(output_dir + '/' + title + '_MB_5m_elevation.tif')
+    with rasterio.open(output_raster, 'w', **meta) as dst:
+        dst.write(data, 1)
 
-    output_raster = output_dir + '/' + title + '_MB_5m_elevation_wgs84.tif'
-
-    with rasterio.open(output_raster) as src:
-        array = src.read(1)
-        transform = src.transform
-        nodata = src.nodatavals[0]
-
-        # Create a binary array: 1 where there's data, 0 where there's no data
-        binary_array = np.where(array == nodata, 0, 1).astype('int16')
-
-        # Dilate the binary array and convert to a compatible dtype
-        dilated_array = binary_dilation(binary_array, iterations=25)
-        dilated_array = dilated_array.astype('uint8')  # Convert to uint8
-
-    # Generate shapes from the dilated binary array
-    geometry = []
-    for shp, val in shapes(dilated_array, transform=transform):
-        if val == 1:  # Only consider shapes with value 1 (dilated areas)
-            geom = shape(shp).simplify(tolerance=0.001)  # Apply simplification
-            if geom.is_valid:
-                geometry.append(geom)
-
-    # Create a GeoDataFrame
-    geo_df = gpd.GeoDataFrame(geometry=geometry, crs=src.crs)
+    # Clean up intermediate files
+    os.remove(intermediate_raster_path)
+    os.remove(output_raster_resampled)
     
+    # Reproject the raster to WGS84
+    output_raster_wgs84 = output_dir + '/' + title + '_wgs84.tif'
+    gdal.Warp(output_raster_wgs84, output_raster, dstSRS='EPSG:4326')
 
-    # Save the bathymetry polygon shapefile
-    bathy_polygon_shp = output_dir + '/' + title + '_bathy_polygon.shp'
-    geo_df.to_file(bathy_polygon_shp, driver='ESRI Shapefile')
+    # Call create_survey_outline to generate the bathymetry polygon shapefile
+    bathy_polygon_shp = create_survey_outline(output_raster, output_dir, title)
+    os.remove(output_raster)
+    output_raster = output_dir + '/' + title + '_wgs84.tif'
 
-    print('Bathymetry polygon shapefile created.')
     return output_raster, bathy_polygon_shp
+
+
 
 def get_raster_value(x, y, raster):
     """ Get the value of the raster at the specified coordinates """
@@ -240,13 +449,13 @@ def get_raster_value(x, y, raster):
 
     if value == nodata:
         return np.nan  # Handle nodata values
-
+    #print(value)
     return value
 
 def derive_draft():
     output_raster, raster_boundary_shp = BAGextract()
     csb_corr = tides()
-
+    
     print('*****Starting derive_draft function*****')
     
     # Load the raster boundary as a GeoDataFrame
@@ -258,19 +467,38 @@ def derive_draft():
 
     # Assign a unique row identifier to the original dataframe
     csb_corr['row_id'] = range(len(csb_corr))
-
+    
+    
     # Perform spatial join to create a subset
     csb_corr_subset = csb_corr[csb_corr.geometry.within(raster_boundary.geometry.unary_union)]
+    print("csb_corr_subset is...")
+    #print(csb_corr_subset)
 
-    print('Performing the raster depth extraction with the subset')
+    # Sample from the subset
+    max_sample_size = 300  # Maximum number of samples per unique_id
+    sampled_csb_corr_subset = pd.DataFrame()
+    for name, group in csb_corr_subset.groupby('unique_id'):
+        if len(group) > max_sample_size:
+            sampled_group = group.sample(n=max_sample_size)
+        else:
+            sampled_group = group
+        sampled_csb_corr_subset = pd.concat([sampled_csb_corr_subset, sampled_group])
+    print("sampled_csb_corr_subset shape after sampling:", sampled_csb_corr_subset.shape)
+    print('Performing the raster depth extraction with the sampled subset')
+    #print("sampled_csb_corr_subset is...")
+    #print(sampled_csb_corr_subset)
 
-    # Extract raster values for each point in the subset
-    csb_corr_subset['Raster_Value'] = csb_corr_subset.apply(
+    # Extract raster values for each point in the sampled subset
+    sampled_csb_corr_subset['Raster_Value'] = sampled_csb_corr_subset.apply(
         lambda row: get_raster_value(row.geometry.x, row.geometry.y, output_raster), axis=1
     )
 
     # Merge the results back into the original dataframe
-    csb_corr = csb_corr.merge(csb_corr_subset[['row_id', 'Raster_Value']], on='row_id', how='left')
+    csb_corr = csb_corr.merge(sampled_csb_corr_subset[['row_id', 'Raster_Value']], on='row_id', how='left')
+
+
+    # Merge the results back into the original dataframe
+    #csb_corr = csb_corr.merge(csb_corr_subset[['row_id', 'Raster_Value']], on='row_id', how='left')
 
     # Calculate the depth difference with the merged data
     print('*****Raster depth extraction complete. Calculating depth difference statistics.*****')
@@ -362,12 +590,23 @@ def rasterize_CSB():
     print('*****Rasterizing CSB data and exporting geotiff*****')
     output_raster_path = output_dir + '/csb_OFFSETS_APPLIED_' + title + '.tif'
     rasterize_with_rasterio(csb_corr1, output_raster_path, resolution)    
+	
+	# Define the path for the PNG plot
+    plot_png_path = output_dir + '/csb_plot_' + title + '.png'
 
+    # Create and save the plot as a PNG file
     with rasterio.open(output_raster_path) as src:
-        fig, ax = plt.subplots()
-        show(src, ax=ax, title='CSB Raster')
-        plt.show()
-        
+        fig, ax = plt.subplots(figsize=(12, 12))  # 1200x1200 pixels
+        show(src, ax=ax, title= title + 'Quick-Look CSB Raster')
+        plt.savefig(plot_png_path, dpi=200)  # Save plot as PNG
+        plt.close(fig)  # Close the figure
+
+    # Open the PNG file using the default image viewer
+    if os.name == 'nt':  # Windows
+        os.system(f'start {plot_png_path}')
+    elif os.name == 'posix':  # macOS, Linux
+        os.system(f'xdg-open {plot_png_path}')
+
     # Open explorer window of CSB processing results
     mod_output_dir = output_dir.replace("/", "\\")
     subprocess.Popen(r'explorer "'+ mod_output_dir)
@@ -379,27 +618,40 @@ def open_file_dialog(var, file_types):
 def open_folder_dialog(var):
     foldername = filedialog.askdirectory()
     var.set(foldername)
-
+	
+def process_csb_threaded():
+    # Create a thread for process_csb function
+    processing_thread = threading.Thread(target=process_csb)
+    processing_thread.start()
+	
 def process_csb():
     start_time = time.time()  # Start the timer
     print("Processing...")
-    global title, output_crs, csb, BAG_filepath, fp_zones, output_dir
+    global title, csb, BAG_filepath, fp_zones, output_dir
 
     # Update global variables
     title = title_var.get()
-    #output_crs = output_crs_var.get()
     csb = csb_var.get()
-    BAG_filepath = BAG_filepath_var.get()
     fp_zones = fp_zones_var.get()
     output_dir = output_dir_var.get()
+    
+    # Update BAG_filepath with the selected file if BlueTopo is not used
+    if not bluetopo_var.get():
+        BAG_filepath = BAG_filepath_var.get()
 
-    # Call the main processing function
-    rasterize_CSB()
+    if bluetopo_var.get():
+        # Update BAG_filepath with the path of the mosaicked raster
+        BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir)
+        rasterize_CSB()
+    else:
+        # If BlueTopo is not selected, BAG_filepath remains as set by the user
+        rasterize_CSB()
     
     end_time = time.time()  # End the timer
     duration = end_time - start_time
     minutes, seconds = divmod(duration, 60)
     print(f"***** DONE! Thanks for all the CSB! *****\nTotal processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
+
 
 # Tkinter GUI setup
 root = tk.Tk()
@@ -414,7 +666,7 @@ fp_zones_var = tk.StringVar()
 output_dir_var = tk.StringVar()
 
 # Layout and widgets
-tk.Label(root, text='Title of CSB Data').grid(row=0, column=0, sticky='w')
+tk.Label(root, text='Title of CSB Data (do not use spaces between words)').grid(row=0, column=0, sticky='w')
 title_entry = tk.Entry(root, textvariable=title_var)
 title_entry.grid(row=0, column=1)
 
@@ -430,23 +682,37 @@ csb_entry = tk.Entry(root, textvariable= csb_var)
 csb_entry.grid(row=1, column=1)
 tk.Button(root, text='Browse', command=lambda: open_file_dialog(csb_var, [("CSV file", "*.csv")])).grid(row=1, column=2)
 
-tk.Label(root, text='Input BAG file for comparison bathymetry').grid(row=2, column=0, sticky='w')
+tk.Label(root, text='Input BAG or GeoTiff file for comparison bathymetry').grid(row=3, column=0, sticky='w')
 BAG_filepath_entry = tk.Entry(root, textvariable= BAG_filepath_var)
-BAG_filepath_entry.grid(row=2, column=1)
-tk.Button(root, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG file", "*.bag")])).grid(row=2, column=2)
+BAG_filepath_entry.grid(row=3, column=1)
+tk.Button(root, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG or GeoTIFF file", "*.bag;*.tif;*.tiff")])).grid(row=3, column=2)
 
-tk.Label(root, text='Tide Zone file in *.shp format').grid(row=3, column=0, sticky='w')
+tk.Label(root, text='Tide Zone file in *.shp format').grid(row=4, column=0, sticky='w')
 fp_zones_entry = tk.Entry(root, textvariable= fp_zones_var)
-fp_zones_entry.grid(row=3, column=1)
-tk.Button(root, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=3, column=2)
+fp_zones_entry.grid(row=4, column=1)
+tk.Button(root, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=4, column=2)
 
-tk.Label(root, text='Specify output folder').grid(row=4, column=0, sticky='w')
+tk.Label(root, text='Specify output folder').grid(row=5, column=0, sticky='w')
 output_dir_entry = tk.Entry(root, textvariable=output_dir_var)
-output_dir_entry.grid(row=4, column=1)
-tk.Button(root, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=4, column=2)
+output_dir_entry.grid(row=5, column=1)
+tk.Button(root, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=5, column=2)
 
 
-tk.Button(root, text='Process', command=process_csb).grid(row=5, column=1, sticky='e')
+tk.Button(root, text='Process', command=process_csb_threaded).grid(row=6, column=1, sticky='e')
+
+bluetopo_var = tk.BooleanVar()
+bluetopo_checkbox = tk.Checkbutton(root, text="Use Automated BlueTopo Download... or,", variable=bluetopo_var)
+bluetopo_checkbox.grid(row=2, column=0, columnspan=2, sticky='w')
+
+def on_bluetopo_check():
+    if bluetopo_var.get():
+        BAG_filepath_entry.config(state='disabled')
+    else:
+        BAG_filepath_entry.config(state='normal')
+
+bluetopo_checkbox.config(command=on_bluetopo_check)
+
+
 
 if __name__ == "__main__":
     root.mainloop()
