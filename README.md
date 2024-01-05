@@ -1,6 +1,9 @@
-# Crowdsourced Bathymtery Processing
+# Crowdsourced Bathymetry Processing
 This tool processes crowdsourced bathymetry from International Hydrographic Organization's Data Centre for Digital Bathymetry (CSV data from their CSB point store). It corrects for water levels/tides
  and data-derived vessel transducer offset values. 
+ 
+An SOP on how to use the tool can be found here (copy and paste this URL in your web browser):  https://github.com/anthonyklemm/Crowdsourced_Bathy_Processing/blob/main/CSB%20Processing%20SOP%20v1.pdf
+
 
 ***Note: This is the first iteration of this tool, and is intended to provide users reconnaissance information from existing CSB data.***
 
