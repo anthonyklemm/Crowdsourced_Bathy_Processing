@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import requests
 import os
-from osgeo import gdal
+from osgeo import gdal, osr
 import subprocess
 import rasterio
 from scipy.interpolate import interp1d
@@ -47,12 +47,12 @@ def loadCSB():
 
     print('*****Reading CSB input csv file***** ')
     df1=gpd.read_file(csb) #read in CSB data in CSV
-    #df1 = df1.head(20000)  # Limit to top 2000 records for debugging
+    #df1 = df1.head(30000)  # Limit to top 0000 records for debugging
     
     df1 = df1.astype({'depth' : 'float'}) #turn depth field numeric (float64)
-    df2 = df1[df1['depth'] > .5] #remove depth values less that 1.2m (filtering out probable noise)
+    df2 = df1[df1['depth'] > .5] #remove depth values less that 0.5m (filtering out probable noise)
     df2 = df2[df2['depth'] < 1000] #remove depths values greater than possibleNYC depths in the area - this value can change based on area)
-    #data cleaning - remove records with erroneous datetimes
+    # Data cleaning - remove records with erroneous datetimes
     df2 = df2.astype({'time':'datetime64'}, errors='ignore')
     df2 = df2.dropna(subset=['time'])
     df2 = df2[df2['time'] > '2014']
@@ -131,7 +131,7 @@ def mosaic_tiles(tiles_dir):
 
 
 
-def fetch_tide_data(station_id, start_date, end_date, interval=None):
+def fetch_tide_data(station_id, start_date, end_date, interval=None, attempt_great_lakes=False):
     base_url = "https://tidesandcurrents.noaa.gov/api/datagetter"
     params = {
         "begin_date": start_date,
@@ -144,8 +144,15 @@ def fetch_tide_data(station_id, start_date, end_date, interval=None):
         "application": "NOAA_Coast_Survey",
         "format": "json"
     }
+
     if interval == 'hilo':
         params["interval"] = interval
+    elif attempt_great_lakes:
+        # Parameters for Great Lakes water level data
+        params.update({
+            "product": "water_level",
+            "datum": "LWD"
+        })
 
     # Construct the URL for debugging
     request_url = requests.Request('GET', base_url, params=params).prepare().url
@@ -160,6 +167,12 @@ def fetch_tide_data(station_id, start_date, end_date, interval=None):
         if 't' in df.columns and 'v' in df.columns:
             df['v'] = df['v'].astype(float)
             df['t'] = pd.to_datetime(df['t'])
+            return df
+    elif 'data' in data:
+        df = pd.json_normalize(data['data'])
+        if 't' in df.columns and 'v' in df.columns:
+            df['v'] = pd.to_numeric(df['v'], errors='coerce')
+            df['t'] = pd.to_datetime(df['t'], errors='coerce')
             return df
         else:
             print(f"Warning: Missing 't' or 'v' column in response for station {station_id}.")
@@ -257,7 +270,7 @@ def tides():
     # Filter out non-numeric ControlStn values
     ts = ts[ts['ControlStn'].str.match(r'^\d+$')]  # Keep only rows where ControlStn is numeric
 
-    #format timestamps for NOAA CO-OPS Tidal Data API
+    # Format timestamps for NOAA CO-OPS Tidal Data API
     ts['min'] = ts['min'].dt.strftime("%Y%m%d %H:%M")
     ts['max'] = ts['max'].dt.strftime("%Y%m%d %H:%M")
     ts = ts.astype({'min': 'datetime64'})
@@ -286,45 +299,45 @@ def tides():
     new_df = new_df.astype({'ControlStn':'str'})
     print('*****retrieving tide data from NOAA COOPS API*****')
     
-    # Keep track of subordinate stations
-    subordinate_stations = set()
-    
     tdf = []
+    known_subordinate_stations = set()
+    known_great_lakes_stations = set()
+
     for ind in new_df.index:
         station_id = new_df['ControlStn'][ind]
-        
-        # Skip the 6-minute prediction attempt if the station is already known to be subordinate
-        if station_id not in subordinate_stations:
+
+        # Directly fetch water level data for known Great Lakes stations
+        if station_id in known_great_lakes_stations:
+            waterlevel_data = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind], attempt_great_lakes=True)
+            if not waterlevel_data.empty:
+                tdf.append(waterlevel_data)
+            else:
+                print(f"No water level data available for Great Lakes station {station_id}.")
+            continue  # Skip to next station
+
+        # Attempt to fetch 6-minute predictions for non-subordinate stations
+        if station_id not in known_subordinate_stations:
             min_predictions = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind])
             if not min_predictions.empty:
                 tdf.append(min_predictions)
                 continue
-    
+
         # Fetch high-low data and interpolate for subordinate stations
-        print(f"Control station {station_id} is subordinate... fetching high & low tide values and performing cosine interpolation")
         hilo_predictions = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind], interval='hilo')
         if not hilo_predictions.empty:
             interpolated_hilo = cosine_interpolation(hilo_predictions, new_df['min'][ind], new_df['max'][ind])
             tdf.append(interpolated_hilo)
+            known_subordinate_stations.add(station_id)
+            continue
+
+        # Attempt to fetch Great Lakes water level data if other data not available
+        waterlevel_data = fetch_tide_data(station_id, new_df['min'][ind], new_df['max'][ind], attempt_great_lakes=True)
+        if not waterlevel_data.empty:
+            tdf.append(waterlevel_data)
+            known_great_lakes_stations.add(station_id)
         else:
-            print(f"Skipping interpolation for station {station_id} due to missing data.")
-        # Add the station to the list of known subordinate stations
-        subordinate_stations.add(station_id)
-    
-    '''
-    tdf = []
-    for ind in new_df.index:
-        # First, try to fetch 6-minute predictions
-        min_predictions = fetch_tide_data(new_df['ControlStn'][ind], new_df['min'][ind], new_df['max'][ind])
-        if not min_predictions.empty:
-            tdf.append(min_predictions)
-        else:
-            # If 6-minute predictions are not available, fetch high-low data and interpolate
-            print("this control station is a subordinate... fetching high & low tide values and performing cosine interpolation")
-            hilo_predictions = fetch_tide_data(new_df['ControlStn'][ind], new_df['min'][ind], new_df['max'][ind], interval='hilo')
-            interpolated_hilo = cosine_interpolation(hilo_predictions, new_df['min'][ind], new_df['max'][ind])
-            tdf.append(interpolated_hilo)
-            '''
+            print(f"No water level data available for station {station_id}.")
+ 
     if tdf:
         tdf = pd.concat(tdf)
         print("Concatenated tdf shape:", tdf.shape)
@@ -380,55 +393,73 @@ def tides():
 def BAGextract():
     print("DEBUG - BAG_filepath:", BAG_filepath)
     print('*****Starting to import BAG bathy and aggregate to 8m geotiff*****')
-    file_extension = os.path.splitext(BAG_filepath)[1].lower()
-
-    output_raster = output_dir + '/' + title + '_MB_5m_elevation__.tif'
-
-    # Open and process the dataset
-    if file_extension in ['.bag', '.tif', '.tiff']:
-        dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
-        if dataset is None:
-            print("Error: Unable to open the file. Check the file path.")
-            return None, None
-    else:
-        print("Error: Unsupported file format.")
-        return None, None
+    #file_extension = os.path.splitext(BAG_filepath)[1].lower()
 
     # Translate options and creation of single-band GeoTIFF
     translate_options = gdal.TranslateOptions(bandList=[1], creationOptions=['COMPRESS=LZW'])
     intermediate_raster_path = output_dir + '/' + title + '_intermediate.tif'
-    gdal.Translate(intermediate_raster_path, dataset, options=translate_options)
-    dataset = None
 
-    # Resample to desired resolution
-    output_raster_resampled = output_dir + '/' + title + '_5m_MLLW.tif'
-    gdal.Warp(output_raster_resampled, intermediate_raster_path, xRes=8, yRes=8)
+    dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
+    if dataset is None:
+        print("Error: Unable to open the file. Check the file path.")
+        return None, None
+
+    gdal.Translate(intermediate_raster_path, dataset, options=translate_options)
+
+    # Check the CRS
+    crs = osr.SpatialReference(wkt=dataset.GetProjection())
+    dataset = None  # Close the dataset
+
+    if crs.IsGeographic():
+        print("Reprojecting GeoTIFF to a projected CRS...")
+        reprojected_raster_path = output_dir + '/' + title + '_reprojected.tif'
+        gdal.Warp(reprojected_raster_path, intermediate_raster_path, dstSRS='EPSG:3395')
+        intermediate_raster_path = reprojected_raster_path
+
+    # Open the intermediate raster to check its resolution
+    with rasterio.open(intermediate_raster_path) as src:
+        res_x, res_y = src.res
+
+    # Check if the resolution is coarser than 8m
+    if max(res_x, res_y) > 8:
+        output_raster = intermediate_raster_path
+    else:
+        # Resample to desired resolution
+        output_raster_resampled = output_dir + '/' + title + '_5m_MLLW.tif'
+        gdal.Warp(output_raster_resampled, intermediate_raster_path, xRes=8, yRes=8)
+        output_raster = output_raster_resampled
+        # Clean up intermediate file
+        os.remove(intermediate_raster_path)
 
     # Replace NaN values and update nodata value in the raster
-    with rasterio.open(output_raster_resampled) as src:
+    with rasterio.open(output_raster) as src:
         data = src.read(1)
         meta = src.meta
-
+    
     data = np.where(np.isnan(data), 1000000, data)
     meta.update(nodata=1000000)
-
+    
     with rasterio.open(output_raster, 'w', **meta) as dst:
         dst.write(data, 1)
-
-    # Clean up intermediate files
-    os.remove(intermediate_raster_path)
-    os.remove(output_raster_resampled)
     
     # Reproject the raster to WGS84
     output_raster_wgs84 = output_dir + '/' + title + '_wgs84.tif'
     gdal.Warp(output_raster_wgs84, output_raster, dstSRS='EPSG:4326')
-
+    
     # Call create_survey_outline to generate the bathymetry polygon shapefile
-    bathy_polygon_shp = create_survey_outline(output_raster, output_dir, title)
-    os.remove(output_raster)
-    output_raster = output_dir + '/' + title + '_wgs84.tif'
-
-    return output_raster, bathy_polygon_shp
+    bathy_polygon_shp = create_survey_outline(output_raster_wgs84, output_dir, title)
+    
+    # Clean up intermediate files
+    try:
+        os.remove(intermediate_raster_path)
+        intermediate_raster_path = output_dir + '/' + title + '_intermediate.tif'
+        os.remove(intermediate_raster_path)
+        os.remove(output_raster_resampled)
+        os.remove(output_raster_wgs84)
+    except Exception:
+        pass
+    
+    return output_raster_wgs84, bathy_polygon_shp
 
 
 
@@ -646,7 +677,7 @@ def process_csb():
     else:
         # If BlueTopo is not selected, BAG_filepath remains as set by the user
         rasterize_CSB()
-    
+    os.remove(output_dir + '/' + title + '_wgs84.tif')
     end_time = time.time()  # End the timer
     duration = end_time - start_time
     minutes, seconds = divmod(duration, 60)
@@ -666,7 +697,7 @@ fp_zones_var = tk.StringVar()
 output_dir_var = tk.StringVar()
 
 # Layout and widgets
-tk.Label(root, text='Title of CSB Data (do not use spaces between words)').grid(row=0, column=0, sticky='w')
+tk.Label(root, text='1. Title of CSB Data (do not use spaces between words)').grid(row=0, column=0, sticky='w')
 title_entry = tk.Entry(root, textvariable=title_var)
 title_entry.grid(row=0, column=1)
 
@@ -677,22 +708,22 @@ title_entry = tk.Entry(root, textvariable=title_var)
 #output_crs_entry = tk.Entry(root, textvariable = output_crs_var)
 #output_crs_entry.grid(row=1, column=1)
 
-tk.Label(root, text='Raw CSB data in *.csv format').grid(row=1, column=0, sticky='w')
+tk.Label(root, text='2. Raw CSB data in *.csv format').grid(row=1, column=0, sticky='w')
 csb_entry = tk.Entry(root, textvariable= csb_var)
 csb_entry.grid(row=1, column=1)
 tk.Button(root, text='Browse', command=lambda: open_file_dialog(csb_var, [("CSV file", "*.csv")])).grid(row=1, column=2)
 
-tk.Label(root, text='Input BAG or GeoTiff file for comparison bathymetry').grid(row=3, column=0, sticky='w')
+tk.Label(root, text='3b. Input BAG or GeoTiff file for comparison bathymetry').grid(row=3, column=0, sticky='w')
 BAG_filepath_entry = tk.Entry(root, textvariable= BAG_filepath_var)
 BAG_filepath_entry.grid(row=3, column=1)
 tk.Button(root, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG or GeoTIFF file", "*.bag;*.tif;*.tiff")])).grid(row=3, column=2)
 
-tk.Label(root, text='Tide Zone file in *.shp format').grid(row=4, column=0, sticky='w')
+tk.Label(root, text='4. Tide Zone file in *.shp format').grid(row=4, column=0, sticky='w')
 fp_zones_entry = tk.Entry(root, textvariable= fp_zones_var)
 fp_zones_entry.grid(row=4, column=1)
 tk.Button(root, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=4, column=2)
 
-tk.Label(root, text='Specify output folder').grid(row=5, column=0, sticky='w')
+tk.Label(root, text='5. Specify output folder').grid(row=5, column=0, sticky='w')
 output_dir_entry = tk.Entry(root, textvariable=output_dir_var)
 output_dir_entry.grid(row=5, column=1)
 tk.Button(root, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=5, column=2)
@@ -701,7 +732,7 @@ tk.Button(root, text='Browse', command=lambda: open_folder_dialog(output_dir_var
 tk.Button(root, text='Process', command=process_csb_threaded).grid(row=6, column=1, sticky='e')
 
 bluetopo_var = tk.BooleanVar()
-bluetopo_checkbox = tk.Checkbutton(root, text="Use Automated BlueTopo Download... or,", variable=bluetopo_var)
+bluetopo_checkbox = tk.Checkbutton(root, text="3a. Use Automated BlueTopo Download... or,", variable=bluetopo_var)
 bluetopo_checkbox.grid(row=2, column=0, columnspan=2, sticky='w')
 
 def on_bluetopo_check():
@@ -711,8 +742,6 @@ def on_bluetopo_check():
         BAG_filepath_entry.config(state='normal')
 
 bluetopo_checkbox.config(command=on_bluetopo_check)
-
-
 
 if __name__ == "__main__":
     root.mainloop()
