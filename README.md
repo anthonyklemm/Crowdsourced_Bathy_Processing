@@ -10,26 +10,87 @@ An SOP on how to use the tool can be found here (copy and paste this URL in your
 ***Contact Anthony Klemm anthony.r.klemm@noaa.gov for any questions regarding this tool*** 
 
 To use this tool, you must download csb data from the IHO Data Centre for Digital Bathymetry https://www.ncei.noaa.gov/maps/iho_dcdb/.
-You must also download a BAG file (or geotiff) for some comparison data in the same area where your CSB tracklines intersect. This is important for the data-derived transducer offset step.
-The script accomodates comparison bathymetry BlueTopo tiles in geotiff format. Use the downloader tool manually in Pydro if interested, OR you can click the option button to have the script auto-download all the bluetopo model tiles automatically (THIS IS THE PREFERRED METHOD in areas where the bluetopo model is available).
+# Crowdsourced Bathymetry (CSB) Processing Pipeline
 
-The tide zone polygons are from NOAA COOPS and a copy of the polygons are located here: "C:\Pydro22\NOAA\site-packages\Python38\svn_repo\HSTB\CSB_processing\tide_zone_polygons.shp" 
-You may find an area of interest with missing tide zone polygons. You can edit this shapefile to include new custom polygons (just understand that this may not be as accurate as the published COOPS zones). 
-If there is a tide reference station nearby, you just need to update the ControlStn attribute of your custom polygon with the correlating tide reference station control number (found on the COOPS website),
-as well as the ATCorr to 0 (which means there is a time correction of zero since it's nearby the tide station), and a RR of 1 (the magnitude coefficient). Also, a beta version of a tie zone polygon dataset is also available with auto-generated zones around subordinate tide prediction stations outside the official tide zone definitions provided by NOAA CO-OPS. **USE WITH CAUTION** They were generated using Voronoi diagram/Thiessen Plogyons algorithm from the point locations of all subordinate tide prediction stations, but were not edited to respect shoreline so there are errors. The script pulls the predicted highs and lows and interpolates between the values using cosine interpolation (which approximates tide changes but adds uncertainty to the estimated values). 
+This application provides a full end-to-end workflow for processing raw Crowdsourced Bathymetry (CSB) data into analysis-ready geospatial products. It features a graphical user interface (GUI) to manage inputs, processing steps, and outputs, making complex geospatial operations accessible.
 
-Basic steps of the script are: 
+The pipeline ingests raw CSV files, applies tidal and vertical offset corrections, performs statistical outlier detection, and generates final products such as a consolidated points GeoPackage and gridded GeoTIFF rasters.
 
-1. Read in CSV file and perform basic outlier filtering
-2. Spatially join CSB points with tide zone polygons
-3. Download waterlevel/tide data from tide control stations for time period of CSB from NOAA COOPS datagetter web API
-4. Perform waterlevel correction to MLLW
-5. Extract geotiff from best available NOAA BAG bathymetry in the area
-6. Extract raster values to CSB points, perform aggregated summary stats of difference between CSB depth and BAG bathymetry.              
-7. Use this table to choose unapplied static vertical transducer offsets of each vessel 
-8. Apply the data-derived static offsets to the CSB data by performing an inner join with the offset table and CSB points
-9. Export CSB points to shapefile for further bathy processing in ArcGIS Pro (IDW gridding, etc...) - The attribute with the final corrected depths is called "depth_fina" and is in WGS84 crs (unprojected).
-10. Export out a quick-look geotiff (not using any interpolation) at EPSG: 3395 (World Mercator) and 50m resolution
+## Features
+
+- **Tide Correction:** Applies tidal adjustments to depth soundings using data from the NOAA Tides and Currents API and a user-provided tide zone shapefile. location of supplied zoned tide model polygons shapefile:
+C:\Pydro24\NOAA\site-packages\Python3\svn_repo\HSTB\CSB_processing\BETA_subordinate_tide_zones\tide_zone_polygons_new_WGS84_merge.shp
+- **Vertical Offset Calibration:** Compares CSB data against a reference bathymetric surface to calculate and apply a vertical offset for each vessel, normalizing data from different sources.
+- **Flexible Reference Surfaces:**
+    - **Automated BlueTopo Download:** Automatically fetches the latest NOAA BlueTopo bathymetric tiles for the specific area covered by the input CSB data.
+    - **Local File Support:** Allows the user to provide their own local reference bathymetry in BAG or GeoTIFF format.
+- **Advanced Outlier Detection:** Employs a multi-pass statistical routine using `scikit-learn`'s `IterativeImputer` to flag potential outliers in each vessel's transit.
+- **Database Backend:** Utilizes DuckDB for efficient intermediate data storage, allowing for complex and fast queries on the processed data.
+- **Incremental Processing & Append-Only Workflow:**
+    - The pipeline is designed for continuous data integration. If an existing csb.duckdb database and master_offsets.csv file are found in the output directory, the script will use them as a baseline.
+    - New CSB data is processed and appended to the existing database.
+    - It leverages existing vessel offsets from master_offsets.csv to avoid re-calculating them, improving consistency and speed.
+    - Post-processing steps are applied only to the newly added data.
+- **Flexible Final Products:**
+    - **Intermediate Products (Optional):** Per-transit GeoPackages and plots.
+    - **Final Products (Optional):**
+        - A consolidated points GeoPackage (`csb_final_points.gpkg`) in EPSG:4326.
+        - A gridded GeoTIFF (`csb_final_gridded.tif`) created by averaging non-outlier points.
+- **Tiled Processing:** Supports providing a tessellation shapefile to process large areas into smaller, tiled GeoTIFFs and GeoPackages.
+- **VRT Creation (Optional):** Automatically organizes tiled GeoTIFFs by their coordinate system and builds a VRT (Virtual Raster) with overviews for each group, making them easy to use in GIS software.
+- **GUI:** A user-friendly graphical interface built with Tkinter to manage all inputs and processing options.
+- **Cleanup:** Automatically removes temporary files after processing.
+
+## How to Use
+
+1.  **Prepare Your Input Data:**
+    - **Raw CSB Directory:** A folder containing one or more CSB data files in `.csv` format.
+    - **Tide Zone Shapefile:** A shapefile that defines the geographic zones for tide correction. It must contain the columns `ControlStn`, `ATCorr`, and `RR`.
+    - **Output Directory:** An empty folder where all output products will be saved.
+    - **(Optional) Reference Bathymetry:** A local BAG or GeoTIFF file if you are not using the automated BlueTopo download.
+    - **(Optional) Tessellation Shapefile:** A polygon shapefile to use for tiled processing.
+
+2.  **Launch the Application:**
+    Run the script from your terminal:
+    ```
+    python csb_processing.py
+    ```
+
+3.  **Configure the Processing Run via the GUI:**
+
+    - **Section 1: Input Files & Folders:** Fill in the paths to your CSB data, tide zone file, and output directory.
+    - **Section 2: Reference Bathymetry:**
+        - Check "Use Automated BlueTopo Download" to have the script fetch reference data automatically.
+        - OR, uncheck it and provide the path to your own local BAG or GeoTIFF file.
+    - **Section 3: Processing & Export Options:**
+        - **Insert into DuckDB:** (Recommended: ON) This is required for all post-processing and final gridding steps.
+        - **Run Post-Processing:** (Recommended: ON) Enables the vertical offset calculation, uncertainty assignment, and outlier flagging. The "Final Gridding" option depends on this step.
+        - **Export Individual Transit Files:** (Optional) If you want to inspect the results of the outlier flagging for every single transit, check this box. Be aware that this can create a very large number of files.
+        - **Run Final Gridding & Export:** (Recommended: ON) Enables the final, primary output stage.
+        - **Export Final Points GeoPackage:** (Recommended: ON) Creates the final `csb_final_points.gpkg` file.
+        - **Optional Tessellation Shapefile:** Provide a shapefile here to enable tiled processing mode. If left blank, the script will produce a single set of final products.
+        - **Grid Resolution (meters):** Set the cell size for the final output GeoTIFF.
+        - **Organize GeoTIFFs ... and Create VRTs:** (Recommended: ON for tiled mode) Automatically sorts tiled outputs and builds virtual rasters.
+
+4.  **Start Processing:** Click the "Start Processing" button. The application window will close automatically when the entire process is complete. Monitor the console for progress updates.
+
+## Output Products
+
+All outputs will be located in the specified **Output Directory**.
+
+- `csb.duckdb`: The intermediate DuckDB database file containing all processed data.
+- `master_offsets.csv`: A CSV file containing the calculated vertical offsets for each vessel.
+- `/histograms/`: A folder containing PNG histograms showing the distribution of offsets for each vessel.
+- `/transit_exports/`: (If enabled) A folder containing plots and GeoPackages for each individual vessel transit.
+- `/final_products/`: This folder contains the primary deliverables.
+    - `csb_final_points.gpkg`: (If enabled) A GeoPackage containing all processed points in EPSG:4326, with an `outlier` field indicating their status.
+    - `csb_final_gridded.tif` or `<id>_gridded.tif`: The final gridded raster(s) in the appropriate UTM zone(s).
+    - `/EPSG_.../`: (If VRT creation is enabled) Subfolders where the GeoTIFFs are organized by their coordinate system. Each folder will contain a `mosaic_EPSG_....vrt` file, which is the best file to load into GIS software.
+
+
+***Contact Anthony Klemm anthony.r.klemm@noaa.gov for any questions regarding this tool*** 
+
+
 
 Images: Comparison of CSB grid (IDW algorithm) vs Hydrographic Survey H13387 in Houston, TX Harbor
 
