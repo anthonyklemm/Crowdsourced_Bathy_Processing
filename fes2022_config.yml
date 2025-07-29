@@ -1,0 +1,19 @@
+# Correct configuration for the FES2022b ocean tide model
+tide:
+  cartesian:
+    paths:
+      2N2: ${DATASET_DIR}/2n2_fes2022.nc
+      K1: ${DATASET_DIR}/k1_fes2022.nc
+      K2: ${DATASET_DIR}/k2_fes2022.nc
+      M2: ${DATASET_DIR}/m2_fes2022.nc
+      M4: ${DATASET_DIR}/m4_fes2022.nc
+      Mf: ${DATASET_DIR}/mf_fes2022.nc
+      Mm: ${DATASET_DIR}/mm_fes2022.nc
+      Msqm: ${DATASET_DIR}/msqm_fes2022.nc
+      Mtm: ${DATASET_DIR}/mtm_fes2022.nc
+      N2: ${DATASET_DIR}/n2_fes2022.nc
+      O1: ${DATASET_DIR}/o1_fes2022.nc
+      P1: ${DATASET_DIR}/p1_fes2022.nc
+      Q1: ${DATASET_DIR}/q1_fes2022.nc
+      S1: ${DATASET_DIR}/s1_fes2022.nc
+      S2: ${DATASET_DIR}/s2_fes2022.nc
