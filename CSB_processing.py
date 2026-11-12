@@ -80,6 +80,14 @@ MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
 pd.set_option('display.max_columns', None)
 
 
+
+import hashlib
+import json
+import tempfile
+from types import SimpleNamespace
+from email.utils import parsedate_to_datetime
+_last_tide_request = None
+
 def setup_logging(output_dir, run_timestamp=None):
     """Configures logging to print to both console and a file."""
     timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -494,6 +502,7 @@ def apply_fes_tides(gdf):
 
 
 def fetch_tide_data(station_id, start_date, end_date, product, interval=None, attempt_great_lakes=False):
+    global _last_tide_request
     base_url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
     params = {
         "begin_date": start_date,
@@ -510,39 +519,139 @@ def fetch_tide_data(station_id, start_date, end_date, product, interval=None, at
         params["interval"] = interval
 
     request_url = requests.Request('GET', base_url, params=params).prepare().url
-    print(f"Requesting URL: {request_url}")
 
-    response = requests.get(base_url, params=params)
-    # data = response.json()
-    if response.status_code != 200:
-        print(f"NOAA API Error for station {station_id}: HTTP {response.status_code}")
-        return pd.DataFrame()
-        
-    try:
-        data = response.json()
-    except Exception as e:
-        print(f"Failed to parse JSON from NOAA API for station {station_id}. Server may be down. Error: {e}")
-        return pd.DataFrame()
+    config = tide_request_settings()
+    key = hashlib.sha256(request_url.encode('utf-8')).hexdigest()
+    cache_file = config.cache / f'{key}.json'
+    if cache_file.is_file():
+        try:
+            df = tide_payload_frame(json.loads(cache_file.read_text(encoding='utf-8')))
+            print(f'Using cached NOAA tides: {cache_file}')
+            return df
+        except (ValueError, TypeError, AttributeError, KeyError):
+            print(f'Ignoring invalid NOAA tide cache: {cache_file}')
 
-    if 'predictions' in data:
-        df = pd.json_normalize(data['predictions'])
-        data_type = "predicted data"
-    elif 'data' in data:
-        df = pd.json_normalize(data['data'])
-        data_type = "observed data"
-    else:
-        print(f"No data returned for URL: {request_url}")
-        return pd.DataFrame()
+    # Keep diagnostics beside the processing log; standalone callers may lack a run.
+    diagnostic_dir = Path(globals().get('run_directory') or output_dir) / 'tide_request_errors'
+    no_data_waits = (2, 10) if product == 'predictions' and interval == 'hilo' else (2,)
+    no_data_attempt = 0
+    attempt = 0
+    no_data_wait = 0
+    while True:
+        if no_data_wait:
+            time.sleep(no_data_wait)
+            no_data_wait = 0
+        if _last_tide_request is not None:
+            time.sleep(max(0.0, config.delay - (time.monotonic() - _last_tide_request)))
+        response = None
+        retry_after = 0.0
+        try:
+            print(f'NOAA request attempt {attempt + 1}/{config.retries + 1}: {request_url}')
+            response = requests.get(base_url, params=params, timeout=(10, 60))
+        except requests.RequestException as exc:
+            error = f'NOAA connection failed: {exc}'
+        else:
+            status = response.status_code
+            if status in (401, 407):
+                path = save_tide_diagnostic(diagnostic_dir, key, request_url, attempt + 1, response)
+                raise RuntimeError(f'NOAA request authentication failure: HTTP {status}. '
+                                   f'Stopping without product fallback. See {path}')
+            if status in (403, 408, 429) or 500 <= status < 600:
+                error = f'NOAA refused or could not serve request: HTTP {status}'
+                header = response.headers.get('Retry-After')
+                if header:
+                    try:
+                        retry_after = max(0.0, float(header))
+                    except ValueError:
+                        try:
+                            retry_after = max(0.0, parsedate_to_datetime(header).timestamp() - time.time())
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+            elif status not in (200, 400):
+                path = save_tide_diagnostic(diagnostic_dir, key, request_url, attempt + 1, response)
+                print(f'NOAA HTTP {status}; trying next fallback. See {path}')
+                return pd.DataFrame()
+            else:
+                try:
+                    data = response.json()
+                    if not isinstance(data, dict):
+                        raise ValueError('Expected a NOAA JSON object')
+                    records = data.get('predictions', data.get('data'))
+                    message = str(data.get('error', ''))
+                    # Only generic HTTP 200 no-data responses receive these
+                    # short retries. Explicit HTTP 400 rejections still fall back.
+                    generic_no_data = status == 200 and (
+                        records == [] or (data.get('error') and any(
+                            phrase in message.lower() for phrase in (
+                                'no data', 'no predictions', 'no verified',
+                                'no preliminary', 'no water level', 'no tide'))))
+                    if generic_no_data:
+                        path = save_tide_diagnostic(diagnostic_dir, key, request_url,
+                                                    no_data_attempt + 1, response)
+                        if no_data_attempt >= len(no_data_waits):
+                            print(f'NOAA no-data response persisted after {no_data_attempt + 1} '
+                                  f'no-data attempts; trying next fallback. See {path}')
+                            return pd.DataFrame()
+                        wait = no_data_waits[no_data_attempt]
+                        no_data_attempt += 1
+                        print(f'NOAA returned no usable records; retrying the SAME request '
+                              f'in {wait} seconds. See {path}')
+                        no_data_wait = wait
+                        continue
+                    if data.get('error'):
+                        # Product fallback is independent of NOAA error wording.
+                        # HTTP 403 was handled above and never reaches this path.
+                        message = str(data['error'])
+                        path = save_tide_diagnostic(diagnostic_dir, key, request_url, attempt + 1, response)
+                        print(f'NOAA API message: {message}; trying next fallback. See {path}')
+                        return pd.DataFrame()
+                    if status != 200:
+                        raise ValueError(f'Unexpected HTTP {status} response')
+                    records = data.get('predictions', data.get('data'))
+                    if records == []:
+                        save_tide_diagnostic(diagnostic_dir, key, request_url, attempt + 1, response)
+                        print('NOAA returned an empty record list; trying next fallback.')
+                        return pd.DataFrame()
+                    df = tide_payload_frame(data)
+                except (ValueError, TypeError, KeyError) as exc:
+                    error = f'Invalid NOAA tide response: {exc}'
+                else:
+                    config.cache.mkdir(parents=True, exist_ok=True)
+                    # Atomic replacement prevents an interrupted write from
+                    # leaving a partial success in the persistent cache.
+                    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                     dir=config.cache, delete=False) as handle:
+                        temporary = Path(handle.name)
+                        json.dump(data, handle)
+                    try:
+                        os.replace(temporary, cache_file)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    print(f'Pulled tide data for station {station_id} from {start_date} to {end_date}; cached {cache_file}')
+                    return df
+        finally:
+            # Space requests from completion, including failures and fallbacks.
+            _last_tide_request = time.monotonic()
 
-    df['t'] = pd.to_datetime(df['t'])
-    # Convert 'v' to numeric, coercing errors to NaN
-    df['v'] = pd.to_numeric(df['v'], errors='coerce')
-    if df['v'].isna().any():
-        print("Warning: Some tide values could not be converted to numeric and will be dropped.")
-        df = df.dropna(subset=['v'])
-
-    print(f"Pulled {data_type} for station {station_id} from {start_date} to {end_date}")
-    return df
+        path = save_tide_diagnostic(diagnostic_dir, key, request_url, attempt + 1, response, error)
+        if attempt >= config.retries:
+            if (response is not None and response.status_code not in (403, 408, 429)
+                    and not 500 <= response.status_code < 600):
+                print(f'{error}; exhausted {config.retries + 1} attempts; trying next fallback. See {path}')
+                return pd.DataFrame()
+            raise RuntimeError(f'{error}; exhausted {config.retries + 1} attempts. '
+                               f'Stopping instead of using incomplete tide data. See {path}')
+        wait = max(config.backoff * (2 ** attempt), retry_after)
+        if wait > 300:
+            if (response is not None and response.status_code not in (403, 408, 429)
+                    and not 500 <= response.status_code < 600):
+                print(f'{error}; retry wait exceeds 300s; trying next fallback. See {path}')
+                return pd.DataFrame()
+            raise RuntimeError(f'{error}; required retry wait {wait:g}s exceeds 300s. '
+                               f'Resume later; successful downloads are cached. See {path}')
+        print(f'{error}; retrying the SAME request in {wait:g} seconds.')
+        time.sleep(wait)
+        attempt += 1
 
 
 def check_for_gaps(dataframe, max_gap_duration='1h'):
@@ -1896,6 +2005,45 @@ def process_csb_for_directory(csb_directory, root_window):
     print("processing complete. closing application window.")
     root_window.destroy()
 
+
+def tide_request_settings():
+    """Use an isolated run cache unless the caller explicitly overrides it."""
+    settings = globals().get('options')
+    return SimpleNamespace(
+        delay=float(getattr(settings, 'tide_request_delay', 0.2)),
+        retries=int(getattr(settings, 'tide_retries', 3)),
+        backoff=float(getattr(settings, 'tide_retry_wait', 30.0)),
+        cache=Path(getattr(settings, 'tide_cache', '') or
+                   Path(output_dir) / 'tide_cache'),
+    )
+
+def tide_payload_frame(data):
+    """Validate records before caching; an API error is not a tide series."""
+    records = data.get('predictions', data.get('data'))
+    if not isinstance(records, list) or not records:
+        raise ValueError('Response has no tide records')
+    df = pd.DataFrame(records)
+    if not {'t', 'v'}.issubset(df.columns):
+        raise ValueError('Tide records are missing t or v')
+    df['t'] = pd.to_datetime(df['t'], errors='raise')
+    df['v'] = pd.to_numeric(df['v'], errors='coerce')
+    df = df.dropna(subset=['t', 'v'])
+    df = df[np.isfinite(df['v'])]
+    if df.empty:
+        raise ValueError('Response has no usable tide records')
+    return df
+
+def save_tide_diagnostic(folder, key, url, attempt, response=None, error=None):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f'{time.time_ns()}_{key[:12]}_attempt{attempt}.json'
+    path.write_text(json.dumps({
+        'url': url, 'attempt': attempt, 'error': str(error) if error else None,
+        'status': response.status_code if response is not None else None,
+        'headers': dict(response.headers) if response is not None else {},
+        'body': response.text if response is not None else None,
+    }, indent=2), encoding='utf-8')
+    print(f'NOAA request diagnostic saved: {path}')
+    return path
 
 def match_zone_tides(soundings, tides, max_time_gap="1h"):
     """Attach v_new and t_new without mixing stations or zone time shifts.
