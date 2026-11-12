@@ -205,6 +205,15 @@ def insert_into_duckdb(gdf, duckdb_path):
 
     try:
         with duckdb.connect(database=duckdb_path, read_only=False) as con:
+            # Commit appended rows AND their input-file fingerprint together.
+            # A failed append rolls back both, so the input can be retried.
+            con.execute("BEGIN TRANSACTION")
+            ensure_ingest_log(con)
+            source_hash = file_sha256(csb)
+            if con.execute("SELECT 1 FROM csb_ingest_log WHERE sha256 = ?", [source_hash]).fetchone():
+                print(f"Already ingested identical CSV: {csb}")
+                con.execute("COMMIT")
+                return
             # Check if the 'csb' table exists
             table_exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='csb'").fetchone()
 
@@ -228,6 +237,12 @@ def insert_into_duckdb(gdf, duckdb_path):
             col_list_for_insert = ", ".join(master_columns)
             con.register("temp_df", df)
             con.execute(f"INSERT INTO csb ({col_list_for_insert}) SELECT * FROM temp_df")
+            con.execute(
+                # Preserve the current instant as a timezone-aware timestamp.
+                "INSERT INTO csb_ingest_log VALUES (?, ?, ?, current_timestamp)",
+                [source_hash, str(Path(csb).resolve()), len(df)],
+            )
+            con.execute("COMMIT")
             
         print(f"Data successfully appended to DuckDB table at {duckdb_path}.")
     except Exception as e:
@@ -2058,16 +2073,46 @@ def cleanup_interim_files(output_dir, title):
 
 # --- END: FINAL GRIDDING AND EXPORT FUNCTIONS ---
     
+def file_sha256(path):
+    """Identify identical input files without relying on paths or filenames."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 
 
+def ensure_ingest_log(con):
+    # This table survives between runs in csb.duckdb. The content hash catches
+    # an identical CSV even after it is renamed or moved. It does not identify
+    # overlapping observations in different files or imports predating the log.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS csb_ingest_log (
+            sha256 VARCHAR PRIMARY KEY, source_path VARCHAR,
+            row_count BIGINT, ingested_at TIMESTAMPTZ
+        )
+    """)
+    column_type = next(row[1] for row in con.execute('DESCRIBE csb_ingest_log').fetchall()
+                       if row[0] == 'ingested_at')
+    if column_type != 'TIMESTAMP WITH TIME ZONE':
+        raise RuntimeError(
+            'Existing csb_ingest_log.ingested_at is not timezone-aware. '
+            'Use a fresh test database or explicitly migrate the old timestamps '
+            'after establishing their original timezone; no conversion was performed.')
 
 
 
-
-
-
+def already_ingested(db_path, source):
+    # Read-only preflight avoids repeating tides/reference preparation for a
+    # committed file. insert_into_duckdb checks again inside its transaction.
+    if not Path(db_path).is_file():
+        return False
+    with duckdb.connect(database=db_path, read_only=True) as con:
+        if not con.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'csb_ingest_log'").fetchone():
+            return False
+        return con.execute("SELECT 1 FROM csb_ingest_log WHERE sha256 = ?", [file_sha256(source)]).fetchone() is not None
 
 
 
@@ -2120,10 +2165,9 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
     for csb_file in csv_files:
         csb = csb_file
         title = os.path.splitext(os.path.basename(csb_file))[0]
-        # We check for a final product to determine if we should skip
-        final_product_check = os.path.join(output_dir, "final_products", "csb_final_gridded.tif")
-        if os.path.exists(final_product_check):
-            print(f"Skipping already processed file based on existing final products: {title}")
+        db_path = os.path.join(output_dir, "csb.duckdb")
+        if options.duckdb and already_ingested(db_path, csb_file):
+            print(f"Skipping previously ingested CSV: {csb_file}")
             continue
 
         print(f"Processing {csb} with title: {title}")
