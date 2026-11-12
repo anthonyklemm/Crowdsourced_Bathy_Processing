@@ -1257,15 +1257,19 @@ def run_export_transits(db_path, exports_folder):
         try:
             bounds = gdf.total_bounds
             x_min, y_min, x_max, y_max = bounds
-            if x_max == x_min or y_max == y_min:
-                raise ValueError("Invalid geographic bounds. All points may be identical or too close.")
-            x_res = int((x_max - x_min) / resolution)
-            y_res = int((y_max - y_min) / resolution)
+            if gdf.empty or not np.isfinite(bounds).all():
+                raise ValueError("Cannot rasterize empty data or nonfinite bounds.")
+            if not np.isfinite(resolution) or resolution <= 0:
+                raise ValueError("Raster resolution must be finite and greater than zero.")
+            # Keep the 8 m cell size; round dimensions up to cover the extent.
+            # Single-location and axis-aligned transits still need one cell.
+            n_cols = max(1, int(np.ceil((x_max - x_min) / resolution)))
+            n_rows = max(1, int(np.ceil((y_max - y_min) / resolution)))
             transform = from_origin(x_min, y_max, resolution, resolution)
             out_meta = {
                 'driver': 'GTiff',
-                'height': y_res,
-                'width': x_res,
+                'height': n_rows,
+                'width': n_cols,
                 'count': 2,
                 'dtype': 'float32',
                 'crs': gdf.crs.to_string(),
@@ -1276,12 +1280,13 @@ def run_export_transits(db_path, exports_folder):
             }
             with rasterio.open(filename, "w", **out_meta) as dest:
                 for idx, col in enumerate(['depth', 'uncertainty'], start=1):
-                    array = np.full((y_res, x_res), out_meta['nodata'], dtype='float32')
+                    array = np.full((n_rows, n_cols), out_meta['nodata'], dtype='float32')
                     for point, value in zip(gdf.geometry, gdf[col]):
-                        col_idx = int((point.x - x_min) / resolution)
-                        row_idx = int((y_max - point.y) / resolution)
-                        if 0 <= col_idx < x_res and 0 <= row_idx < y_res:
-                            array[row_idx, col_idx] = value
+                        # Include points exactly on the right/bottom outer edge
+                        # in the last cell instead of silently dropping them.
+                        col_idx = min(int((point.x - x_min) / resolution), n_cols - 1)
+                        row_idx = min(int((y_max - point.y) / resolution), n_rows - 1)
+                        array[row_idx, col_idx] = value
                     dest.write(array, idx)
         except Exception as e:
             print(f"Failed to create GeoTIFF for {filename}. Error: {str(e)}")
@@ -1432,7 +1437,7 @@ def run_export_transits(db_path, exports_folder):
                         print(f"No valid points left in transit {transit_id}. Skipping export.")
                         continue
                     
-                    non_outlier_gdf = gdf[gdf['Outlier'] == False]
+                    non_outlier_gdf = gdf[gdf['Outlier'] == False].copy()
                     if non_outlier_gdf.empty:
                         print(f"No non-outlier points left in transit {transit_id}. Skipping export.")
                         continue
