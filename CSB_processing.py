@@ -37,7 +37,7 @@ from shapely.geometry import shape, LineString, Point
 from shapely.validation import make_valid
 from rasterio.transform import from_origin
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -80,14 +80,18 @@ MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
 pd.set_option('display.max_columns', None)
 
 
-def setup_logging(output_dir):
+def setup_logging(output_dir, run_timestamp=None):
     """Configures logging to print to both console and a file."""
-    log_file = os.path.join(output_dir, f"processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(output_dir, f"processing_log_{timestamp}.txt")
     
+    # UTC log entries retain the original filename format and include a UTC label.
+    logging.Formatter.converter = time.gmtime
     # Configure the logger
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        force=True,  # Close handlers from an earlier GUI run before opening this log.
+        format='%(asctime)s UTC - %(levelname)s - %(message)s',
         # Specify UTF-8 encoding for the file handler to support all characters
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
@@ -105,6 +109,7 @@ def setup_logging(output_dir):
         __builtins__.print = logger_print
     
     print("--- Logging configured. Output will be saved to log file. ---")
+    return timestamp
 
 def loadCSB():
     print('*****Reading CSB input csv file in chunks*****')
@@ -119,14 +124,20 @@ def loadCSB():
             
             # Apply the same cleaning and filtering logic to each chunk
             chunk['depth'] = pd.to_numeric(chunk['depth'], errors='coerce')
-            chunk['time'] = pd.to_datetime(chunk['time'], errors='coerce')
+            # CSB timestamps are UTC; inputs can include Z or explicit offsets.
+            # Convert to UTC first, then remove timezone metadata to match the
+            # pipeline's timezone-naive GMT tide series and date bounds. Values
+            # without an offset are interpreted as UTC, not local computer time.
+            chunk['time'] = pd.to_datetime(
+                chunk['time'], errors='coerce', utc=True
+            ).dt.tz_localize(None)
             
             chunk = chunk.dropna(subset=['time', 'depth'])
             
             chunk = chunk[(chunk['depth'] > 0.5) & (chunk['depth'] < 1000)]
             
             lower_bound = pd.to_datetime("2014")
-            upper_bound = pd.to_datetime(str(datetime.now().year + 1))
+            upper_bound = pd.to_datetime(str(datetime.now(timezone.utc).year + 1))
             chunk = chunk[(chunk['time'] > lower_bound) & (chunk['time'] < upper_bound)]
             
             chunk = chunk.drop_duplicates(subset=['lon', 'lat', 'depth', 'time', 'unique_id'])
