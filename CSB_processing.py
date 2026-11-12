@@ -671,7 +671,7 @@ def tide_request_settings():
         retries=int(getattr(settings, 'tide_retries', 3)),
         backoff=float(getattr(settings, 'tide_retry_wait', 30.0)),
         cache=Path(getattr(settings, 'tide_cache', '') or
-                   Path(output_dir) / 'tide_cache'),
+                   Path(globals().get('run_directory') or output_dir) / 'tide_cache'),
     )
 
 
@@ -2413,6 +2413,14 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
         duration = end_time - start_time
         minutes, seconds = divmod(duration, 60)
         publish_successful_run(output_dir, run_directory)
+        # Only remove our managed run cache, never an explicit external cache.
+        run_cache = Path(run_directory) / 'tide_cache'
+        if run_cache.is_dir():
+            try:
+                shutil.rmtree(run_cache)
+                print(f'Removed successful run tide cache: {run_cache}')
+            except OSError as exc:
+                print(f'WARNING: Run succeeded but could not remove tide cache {run_cache}: {exc}')
         print(f"Latest successful run: {run_directory}")
         print(f"***** ALL STAGES DONE! Total processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
         print("Processing complete.")
