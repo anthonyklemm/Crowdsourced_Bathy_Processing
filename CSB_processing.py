@@ -1189,7 +1189,7 @@ def derive_draft(master_offsets_df, report=None): # Added report default for saf
             out.loc[:, 'count'] = out['count'].fillna(0)
             out.loc[(out['mean'] > 3) | (out['mean'] < -11), ['mean', 'std', 'count']] = [0, 999, 0]
             out.loc[(out['std'] > 7), ['mean', 'std', 'count']] = [0, 999, 0]
-            out.to_csv(os.path.join(output_dir, 'VESSEL_OFFSETS_csb_corr_' + title + '.csv'), mode='a')
+            out.to_csv(os.path.join(run_directory, 'VESSEL_OFFSETS_csb_corr_' + title + '.csv'), mode='w')
 
             platform_mapping = filtered_csb_corr[['unique_id', 'platform_name']].drop_duplicates()
             out_with_platform = out.merge(platform_mapping, on='unique_id', how='left')
@@ -2104,7 +2104,20 @@ def file_sha256(path):
             digest.update(block)
     return digest.hexdigest()
 
-
+def record_local_reference(reference_path, run_path):
+    """Record the supplied raster once per run, before processing any CSVs."""
+    reference = Path(reference_path).resolve(strict=True)
+    checksum = file_sha256(reference)
+    metadata = reference.stat()
+    report = Path(run_path) / 'local_reference_surface.txt'
+    report.write_text(
+        f'Reference surface: {reference}\n'
+        f'SHA256: {checksum}\n'
+        f'File size (bytes): {metadata.st_size}\n'
+        f'Modification time (UTC): {datetime.fromtimestamp(metadata.st_mtime, timezone.utc).isoformat()}\n',
+        encoding='utf-8')
+    print(f'Local reference surface recorded: {report}')
+    return report
 
 
 def ensure_ingest_log(con):
@@ -2137,10 +2150,35 @@ def already_ingested(db_path, source):
             return False
         return con.execute("SELECT 1 FROM csb_ingest_log WHERE sha256 = ?", [file_sha256(source)]).fetchone() is not None
 
+def create_run_directory(output_directory):
+    """Allocate a new seconds-stamped run without overwriting an earlier run."""
+    runs = Path(output_directory) / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    counter = 1
+    while True:
+        name = stamp if counter == 1 else f"{stamp}_{counter:02d}"
+        directory = runs / name
+        try:
+            directory.mkdir()
+            return directory
+        except FileExistsError:
+            counter += 1
 
 
-
-
+def publish_successful_run(output_directory, run_directory):
+    """Atomically publish the completed run; never replace the pointer on failure."""
+    root = Path(output_directory).resolve()
+    run = Path(run_directory).resolve()
+    run.relative_to(root / "runs")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                     dir=root, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(str(run) + "\n")
+    try:
+        os.replace(temporary, root / "latest_successful_run.txt")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def open_file_dialog(var, file_types):
@@ -2166,80 +2204,98 @@ def process_csb_threaded():
 
 def process_csb_for_directory(csb_directory, root_window=None, settings=None):
     start_time = time.time()
-    global csb, title, fp_zones, use_bluetopo, output_dir, BAG_filepath, options
+    global csb, title, fp_zones, output_dir, BAG_filepath, options, run_directory
     options = settings if settings is not None else settings_from_gui()
     csb = options.csb_directory
     fp_zones = options.tide_zones
-    output_dir = options.output_directory
+    output_dir = os.path.abspath(options.output_directory)
     os.makedirs(output_dir, exist_ok=True)
-    setup_logging(output_dir)
-    csb_directory = os.path.abspath(csb_directory)
-    fp_zones = os.path.abspath(fp_zones)
-    output_dir = os.path.abspath(output_dir)
-    print(f"output_dir is: {output_dir}")
+    run_directory = create_run_directory(output_dir)
+    setup_logging(str(run_directory), run_directory.name)
+    print(f"Run output directory: {run_directory}")
+    try:
+        csb_directory = os.path.abspath(csb_directory)
+        fp_zones = os.path.abspath(fp_zones)
+        output_dir = os.path.abspath(output_dir)
+        print(f"output_dir is: {output_dir}")
 
-    # --- Load master offsets once at the start ---
-    MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
-    if os.path.exists(MASTER_OFFSET_FILE):
-        print(f"Found existing master offsets file at: {MASTER_OFFSET_FILE}")
-        master_offsets_df = pd.read_csv(MASTER_OFFSET_FILE)
-    else:
-        print("No master_offsets.csv found. Will create a new one.")
-        master_offsets_df = pd.DataFrame(columns=['unique_id', 'platform_name', 'offset_value', 'std_dev', 'accuracy_score', 'date_range', 'tile_name'])
-
-    csv_files = [os.path.join(csb_directory, f) for f in os.listdir(csb_directory) if f.endswith('.csv')]
-    for csb_file in csv_files:
-        csb = csb_file
-        title = os.path.splitext(os.path.basename(csb_file))[0]
-        db_path = os.path.join(output_dir, "csb.duckdb")
-        if options.duckdb and already_ingested(db_path, csb_file):
-            print(f"Skipping previously ingested CSV: {csb_file}")
-            continue
-
-        print(f"Processing {csb} with title: {title}")
-        try:
-            modeling_dir_path = os.path.join(output_dir, "Modeling")
-            try:
-                shutil.rmtree(modeling_dir_path)
-            except FileNotFoundError:
-                pass # It's ok if it doesn't exist
-            except Exception as e:
-                print(f"Error deleting old Modeling folder: {e}")
-            
-            if options.bluetopo:
-                BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir, use_bluetopo=True)
-            else:
-                BAG_filepath = options.reference_bathymetry
-            
-            # ---Pass the master_offsets_df to rasterize_CSB ---
-            rasterize_CSB(master_offsets_df)
-            
-        except Exception as e:
-            raise RuntimeError(f"Initial processing failed for {csb}") from e
-        finally:
-            cleanup_interim_files(output_dir, title)
-
-    if options.analysis:
-        print("\n***** Starting Post-Processing Analysis *****")
-        db_path = os.path.join(output_dir, "csb.duckdb")
-        hist_export_dir = os.path.join(output_dir, "histograms")
-        exports_folder = os.path.join(output_dir, "transit_exports")
-
-        if not os.path.exists(db_path):
-            raise FileNotFoundError(f"DuckDB file not found at {db_path}. Cannot run analysis.")
+        # --- Load master offsets once at the start ---
+        MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
+        if os.path.exists(MASTER_OFFSET_FILE):
+            print(f"Found existing master offsets file at: {MASTER_OFFSET_FILE}")
+            master_offsets_df = pd.read_csv(MASTER_OFFSET_FILE)
         else:
-            run_histograms_calibration_points(db_path, hist_export_dir)
-            run_apply_best_offsets(db_path, refresh_all=options.refresh_all_depths)
-            run_export_transits(db_path, exports_folder) # This now checks internally if it should run
-            
-    if options.final_grid:
-        run_final_gridding_and_export()
-            
-    end_time = time.time()
-    duration = end_time - start_time
-    minutes, seconds = divmod(duration, 60)
-    print(f"***** ALL STAGES DONE! Total processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
-    print("processing complete. closing application window.")
+            print("No master_offsets.csv found. Will create a new one.")
+            master_offsets_df = pd.DataFrame(columns=['unique_id', 'platform_name', 'offset_value', 'std_dev', 'accuracy_score', 'date_range', 'tile_name'])
+
+        db_path = os.path.join(output_dir, "csb.duckdb")
+        if Path(db_path).is_file():
+            with duckdb.connect(database=db_path, read_only=True) as con:
+                has_log = con.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'csb_ingest_log'").fetchone()
+                if not has_log:
+                    print("WARNING: Existing database has no input-file ledger. Supply only CSVs not previously ingested; historical inputs cannot be identified automatically.")
+        # A final grid is not evidence that a particular CSV has been ingested.
+        # Use the persistent file ledger instead; do not scan input subfolders.
+        csv_files = sorted(str(path) for path in Path(csb_directory).glob("*.csv"))
+        if not options.bluetopo:
+            record_local_reference(options.reference_bathymetry, run_directory)
+        for csb_file in csv_files:
+            csb = csb_file
+            title = os.path.splitext(os.path.basename(csb_file))[0]
+            if options.duckdb and already_ingested(db_path, csb_file):
+                print(f"Skipping previously ingested CSV: {csb_file}")
+                continue
+
+            print(f"Processing {csb} with title: {title}")
+            try:
+                modeling_dir_path = os.path.join(output_dir, "Modeling")
+                try:
+                    shutil.rmtree(modeling_dir_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"Error deleting old Modeling folder: {e}")
+                if options.bluetopo:
+                    BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir, use_bluetopo=True)
+                else:
+                    BAG_filepath = options.reference_bathymetry
+                
+                # ---Pass the master_offsets_df to rasterize_CSB ---
+                rasterize_CSB(master_offsets_df)
+                
+            except Exception as e:
+                # Abort instead of publishing products from an incomplete batch.
+                # Previously committed files stay logged and will be skipped on retry.
+                raise RuntimeError(f"Initial processing failed for {csb}") from e
+            finally:
+                cleanup_interim_files(output_dir, title)
+
+        if options.analysis:
+            print("\n***** Starting Post-Processing Analysis *****")
+            db_path = os.path.join(output_dir, "csb.duckdb")
+            hist_export_dir = str(run_directory / "histograms")
+            exports_folder = os.path.join(output_dir, "transit_exports")
+
+            if not os.path.exists(db_path):
+                raise FileNotFoundError(f"DuckDB file not found at {db_path}. Cannot run analysis.")
+            else:
+                run_histograms_calibration_points(db_path, hist_export_dir)
+                run_apply_best_offsets(db_path, refresh_all=options.refresh_all_depths)
+                run_export_transits(db_path, exports_folder) # This now checks internally if it should run
+                
+        if options.final_grid:
+            run_final_gridding_and_export(str(run_directory / "final_products"))
+                
+        end_time = time.time()
+        duration = end_time - start_time
+        minutes, seconds = divmod(duration, 60)
+        publish_successful_run(output_dir, run_directory)
+        print(f"Latest successful run: {run_directory}")
+        print(f"***** ALL STAGES DONE! Total processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
+        print("Processing complete.")
+    except Exception:
+        logging.exception(f"Run failed; latest_successful_run.txt was not updated. Run directory: {run_directory}")
+        raise
     if root_window is not None:
         root_window.destroy()
 
