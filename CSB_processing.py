@@ -1411,7 +1411,7 @@ def run_histograms_calibration_points(db_path, hist_export_dir):
 
     print("Completed Step 1.")
 
-def run_apply_best_offsets(db_path):
+def run_apply_best_offsets(db_path, refresh_all=False):
     print("Starting Post-Processing Step 2: Apply Best Offsets")
     with duckdb.connect(database=db_path, read_only=False) as con:
         # Check if columns exist; if not, add them. This is safer for iterative runs.
@@ -1424,7 +1424,16 @@ def run_apply_best_offsets(db_path):
             con.execute("ALTER TABLE csb ADD COLUMN uncertainty_hori DOUBLE;")
 
 
-        print("Applying best offsets to new data...")
+        # Reset and recalibration are one transaction: failures must not leave
+        # the historical depths cleared or only some vessels recalculated.
+        con.execute("BEGIN TRANSACTION")
+        if refresh_all:
+            # depthfinal remains the original ingest result and calibration fallback.
+            # Retain historical transit IDs, flags and speeds; the original
+            # transit routine will continue to analyze only unprocessed rows.
+            con.execute("UPDATE csb SET depth_mod = NULL, uncertainty_vert = NULL")
+            print("Recalculating calibrated depths and uncertainty for all observations.")
+        print("Applying best offsets to observations with unset depth_mod...")
         con.execute("""
         UPDATE csb
         SET depth_mod = (depth_new - sub.average_diff) * -1
@@ -1447,11 +1456,12 @@ def run_apply_best_offsets(db_path):
         print("Updated remaining depth_mod values with initial depthfinal.")
 
         # Calculate uncertainty only for new rows ---
-        print("Calculating CATZOC uncertainty for new data...")
+        print("Calculating CATZOC uncertainty for observations with unset uncertainty...")
         uncert_vert_query = "UPDATE csb SET uncertainty_vert = (2 + (depth_mod * -0.05)) WHERE uncertainty_vert IS NULL"
         uncert_hori_query = "UPDATE csb SET uncertainty_hori = 10 WHERE uncertainty_hori IS NULL"
         con.execute(uncert_vert_query)
         con.execute(uncert_hori_query)
+        con.execute("COMMIT")
         print("Uncertainty values calculated.")
 
     print("Completed Step 2.")
@@ -2134,6 +2144,9 @@ def process_csb_threaded():
         print("Selected path is not a directory.")
         return
     settings = settings_from_gui()
+    if settings.refresh_all_depths and not (settings.analysis and settings.duckdb):
+        print("Historical depth refresh requires post-processing and DuckDB insertion.")
+        return
     # Capture Tk values on the GUI thread; processing uses plain settings.
     processing_thread = threading.Thread(target=process_csb_for_directory, args=(csb_directory, root, settings))
     processing_thread.start()
@@ -2203,7 +2216,7 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
             print(f"Error: DuckDB file not found at {db_path}. Cannot run analysis.")
         else:
             run_histograms_calibration_points(db_path, hist_export_dir)
-            run_apply_best_offsets(db_path)
+            run_apply_best_offsets(db_path, refresh_all=options.refresh_all_depths)
             run_export_transits(db_path, exports_folder) # This now checks internally if it should run
             
     if options.final_grid:
@@ -2238,12 +2251,13 @@ def settings_from_gui():
         fes=fes_model_var.get(),
         fes_data=fes_path_var.get(),
         fes_config=fes_yaml_var.get(),
+        refresh_all_depths=refresh_all_depths_var.get(),
     )
 
 
 def launch_gui():
     """Build the original interface only when GUI mode is requested."""
-    global root, tk, filedialog, ttk
+    global root, tk, filedialog, ttk, refresh_all_depths_var
     global csb_var, fp_zones_var, output_dir_var, BAG_filepath_var, bluetopo_var, duckdb_option_var, export_gp_var, run_analysis_var, export_transits_var, run_final_grid_var, organize_vrt_var, tessellation_shp_var, grid_resolution_var, export_final_gpkg_var, fes_model_var, fes_path_var, fes_yaml_var
     import tkinter as tk
     from tkinter import filedialog, ttk
@@ -2278,6 +2292,7 @@ def launch_gui():
     export_gp_var = tk.BooleanVar(value=False)
     run_analysis_var = tk.BooleanVar(value=True)
     # Off by default to preserve published historical depths unless requested.
+    refresh_all_depths_var = tk.BooleanVar(value=False)
     export_transits_var = tk.BooleanVar(value=False)
     run_final_grid_var = tk.BooleanVar(value=True)
     organize_vrt_var = tk.BooleanVar(value=True)
@@ -2334,6 +2349,11 @@ def launch_gui():
     row_num += 1
 
     # Optional minimal reset: keep historical transits, flags and speeds.
+    ttk.Checkbutton(
+        options_frame,
+        text="Recalculate historical depths and vertical uncertainty (requires post-processing)",
+        variable=refresh_all_depths_var,
+    ).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=25)
     row_num += 1
 
     export_transits_checkbox = ttk.Checkbutton(options_frame, text="Export Individual Transit Files (GPKG & GeoTIFF)", variable=export_transits_var)
@@ -2450,6 +2470,8 @@ def build_parser():
     parser.add_argument("--fes", action="store_true", help="Use FES tides instead of NOAA tide zones.")
     parser.add_argument("--fes-data", default="", help="FES constituent data folder.")
     parser.add_argument("--fes-config", default=str(PYDRO_CSB_DIR / "fes2022_config.yml"))
+    parser.add_argument("--refresh-all-depths", action="store_true",
+                        help="Recalculate all depth_mod and vertical uncertainty values; retain historical transit IDs, flags and speeds.")
     parser.add_argument("--tide-request-delay", type=float, default=0.2,
                         help="Minimum seconds between NOAA requests (GUI default: 2).")
     parser.add_argument("--tide-retries", type=int, default=3,
@@ -2492,6 +2514,8 @@ def main(argv=None):
         parser.error("analysis and final gridding require --duckdb")
     if args.final_grid and not args.analysis:
         parser.error("final gridding requires --analysis")
+    if args.refresh_all_depths and not args.analysis:
+        parser.error("--refresh-all-depths requires --analysis")
     if args.export_transits and not args.analysis:
         parser.error("--export-transits requires --analysis")
     files = [("reference bathymetry", args.reference_bathymetry), ("tessellation", args.tessellation)]
