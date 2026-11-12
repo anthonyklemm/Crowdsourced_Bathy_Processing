@@ -18,6 +18,8 @@ This script integrates multiple stages of CSB data processing:
     tessellation scheme.
 4.  (Optional) Organization of final rasters by CRS and VRT creation.
 
+also allows option for FES2022b tides which reference to approximate LAT (not MLLW)
+
 """
 
 import tkinter as tk
@@ -27,7 +29,7 @@ import pandas as pd
 import numpy as np
 import requests
 import os
-from osgeo import gdal, osr
+from osgeo import gdal
 import rasterio
 from scipy.interpolate import interp1d
 from rasterio.features import shapes, rasterize
@@ -42,7 +44,6 @@ import matplotlib.pyplot as plt
 import time
 import threading
 from rasterio.merge import merge
-from rasterio.enums import Resampling as rioResampling
 from shapely.ops import unary_union
 from skimage.morphology import binary_dilation, binary_erosion
 import shutil
@@ -50,8 +51,13 @@ import glob
 import subprocess
 import duckdb
 import gc
-import math
-from fes_model import get_fes_tide
+from pathlib import Path
+import sys
+sys.path.append(r"C:\Pydro24\NOAA\site-packages\Python3\svn_repo\HSTB\CSB_processing")
+from fes_model import get_fes_tide, get_lat_separation
+import logging
+import sys
+
 
 # --- IMPORTS for post-processing analysis ---
 import seaborn as sns
@@ -74,28 +80,68 @@ MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
 pd.set_option('display.max_columns', None)
 
 
+def setup_logging(output_dir):
+    """Configures logging to print to both console and a file."""
+    log_file = os.path.join(output_dir, f"processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    
+    # Configure the logger
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        # Specify UTF-8 encoding for the file handler to support all characters
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Redirect the built-in print function to the logger
+    def logger_print(*args, **kwargs):
+        logging.info(' '.join(map(str, args)))
+    
+    if isinstance(__builtins__, dict):
+        __builtins__['print'] = logger_print
+    else:
+        __builtins__.print = logger_print
+    
+    print("--- Logging configured. Output will be saved to log file. ---")
+
 def loadCSB():
-    print('*****Reading CSB input csv file*****')
+    print('*****Reading CSB input csv file in chunks*****')
     
-    df = pd.read_csv(csb)
+    chunk_size = 5_000_000
+    processed_chunks = []
     
-    # Convert 'depth' to numeric and 'time' to datetime; invalid parsing results in NaN
-    df['depth'] = pd.to_numeric(df['depth'], errors='coerce')
-    df['time'] = pd.to_datetime(df['time'], errors='coerce')
-    
-    # Drop rows where 'time' or 'depth' conversion failed
-    df = df.dropna(subset=['time', 'depth'])
-    
-    # Filter rows based on depth criteria
-    df = df[(df['depth'] > 0.5) & (df['depth'] < 1000)]
-    
-    # Define time bounds and filter by time
-    lower_bound = pd.to_datetime("2014")
-    upper_bound = pd.to_datetime(str(datetime.now().year + 1))
-    df = df[(df['time'] > lower_bound) & (df['time'] < upper_bound)]
-    
-    # Drop duplicate rows based on key columns
-    df = df.drop_duplicates(subset=['lon', 'lat', 'depth', 'time', 'unique_id'])
+    # This creates an iterator that yields a DataFrame chunk on each loop
+    with pd.read_csv(csb, chunksize=chunk_size, low_memory=False) as reader:
+        for i, chunk in enumerate(reader):
+            print(f"Processing chunk {i+1}...")
+            
+            # Apply the same cleaning and filtering logic to each chunk
+            chunk['depth'] = pd.to_numeric(chunk['depth'], errors='coerce')
+            chunk['time'] = pd.to_datetime(chunk['time'], errors='coerce')
+            
+            chunk = chunk.dropna(subset=['time', 'depth'])
+            
+            chunk = chunk[(chunk['depth'] > 0.5) & (chunk['depth'] < 1000)]
+            
+            lower_bound = pd.to_datetime("2014")
+            upper_bound = pd.to_datetime(str(datetime.now().year + 1))
+            chunk = chunk[(chunk['time'] > lower_bound) & (chunk['time'] < upper_bound)]
+            
+            chunk = chunk.drop_duplicates(subset=['lon', 'lat', 'depth', 'time', 'unique_id'])
+            
+            if not chunk.empty:
+                processed_chunks.append(chunk)
+
+    if not processed_chunks:
+        print("Warning: No valid data found in the CSV after filtering.")
+        # Return an empty GeoDataFrame with expected columns to prevent downstream errors
+        return gpd.GeoDataFrame([], columns=['lon', 'lat', 'depth', 'time', 'unique_id', 'geometry'], crs="EPSG:4326")
+
+    print("Concatenating processed chunks...")
+    # Combine all the processed chunks into a single DataFrame
+    df = pd.concat(processed_chunks, ignore_index=True)
     
     # Create a GeoDataFrame using lon/lat columns
     gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs="EPSG:4326")
@@ -169,8 +215,8 @@ def insert_into_duckdb(gdf, duckdb_path):
         raise e
 
             
-def draft_corr(master_offsets_df): # MODIFIED: Accept DataFrame
-    csb_corr = derive_draft(master_offsets_df) # MODIFIED: Pass DataFrame
+def draft_corr(master_offsets_df): 
+    csb_corr = derive_draft(master_offsets_df) 
 
     # Merge the CSB data with the master offsets based on unique vessel ID
     # This will now include any newly derived offsets from the step above
@@ -190,8 +236,8 @@ def draft_corr(master_offsets_df): # MODIFIED: Accept DataFrame
     # Instead of immediately exporting to geopackage, return the processed GeoDataFrame.
     return csb_corr1
 
-def rasterize_CSB(master_offsets_df): # MODIFIED: Accept DataFrame
-    csb_corr1 = draft_corr(master_offsets_df) # MODIFIED: Pass DataFrame
+def rasterize_CSB(master_offsets_df):
+    csb_corr1 = draft_corr(master_offsets_df)
     
     #Based on GUI options, insert processed data into DuckDB.
     if duckdb_option_var.get():
@@ -313,8 +359,17 @@ def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetop
     convex_hull_shapefile = os.path.join(output_dir, "convex_hull_polygon.shp")
     convex_hull_gdf.to_file(convex_hull_shapefile)
     print(f"Convex hull shapefile written to: {convex_hull_shapefile}")
-
+    
     if use_bluetopo:
+        # Define the expected VRT directory and path based on the title
+        vrt_dir = os.path.join(output_dir, f"BlueTopo_VRT_{title}")
+        vrt_path = os.path.join(vrt_dir, f"merged_tiles_{title}.vrt")
+
+        # Check if VRT already exists
+        if os.path.exists(vrt_path):
+            print(f"Existing BlueTopo VRT found at {vrt_path}. Skipping new download.")
+            return vrt_path
+    
         # Create the 'Modeling' folder for downloading tiles
         bluetopo_tiles_dir = os.path.join(output_dir, "Modeling")
         os.makedirs(bluetopo_tiles_dir, exist_ok=True)
@@ -386,10 +441,16 @@ def reproject_raster(input_raster, output_raster, dst_crs):
 
 def apply_fes_tides(gdf):
     """
-    Applies tides using the FES global model.
-    The resulting depths are referenced to MSL.
+    Applies tides using the FES global model and transforms the result
+    directly to be referenced to Lowest Astronomical Tide (LAT).
     """
-    print("***** Applying tides using global FES model *****")
+    print("***** Applying tides using global FES model (referenced to LAT) *****")
+    
+    if gdf.empty:
+        print("Data is empty. Skipping FES calculations.")
+        gdf['depth_new'] = pd.Series(dtype='float64')
+        gdf = gdf.rename(columns={'depth': 'depth_old'})
+        return gdf
     
     fes_data_path = fes_path_var.get()
     fes_yaml_path = fes_yaml_var.get()
@@ -401,17 +462,25 @@ def apply_fes_tides(gdf):
     lats = gdf['lat'].to_numpy()
     times = gdf['time'].to_numpy(dtype='datetime64[us]')
     
-    # Call our new function
-    tide_values_msl = get_fes_tide(lons, lats, times, fes_data_path, fes_yaml_path)
+    # Step 1: Get the standard tide prediction relative to MSL
+    msl_tide_values = get_fes_tide(lons, lats, times, fes_data_path, fes_yaml_path)
     
-    # Apply the correction: Depth Correction = Original Depth - Tide Height
-    gdf['depth_new'] = gdf['depth'] - tide_values_msl
+    # Step 2: Get the MSL-to-LAT separation value for each point using the fast formula
+    lat_separation_values = get_lat_separation(lons, lats, fes_data_path)
+    
+    # Step 3: Combine them to get the final tide corrector relative to LAT
+    # CORRECT FORMULA: Tide relative to LAT = Tide relative to MSL + Separation from MSL down to LAT
+    lat_tide_values = msl_tide_values + lat_separation_values
+    
+    # Apply the final LAT-referenced correction to the raw depths
+    gdf['depth_new'] = gdf['depth'] - lat_tide_values
     
     # Clean up and prepare for next steps
     gdf = gdf.rename(columns={'depth': 'depth_old'})
     
-    print("***** FES tide correction complete. Depths are referenced to MSL. *****")
+    print("***** FES tide correction complete. Depths are referenced to approx. LAT. *****")
     return gdf
+
 
 def fetch_tide_data(station_id, start_date, end_date, product, interval=None, attempt_great_lakes=False):
     base_url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
@@ -433,7 +502,16 @@ def fetch_tide_data(station_id, start_date, end_date, product, interval=None, at
     print(f"Requesting URL: {request_url}")
 
     response = requests.get(base_url, params=params)
-    data = response.json()
+    # data = response.json()
+    if response.status_code != 200:
+        print(f"NOAA API Error for station {station_id}: HTTP {response.status_code}")
+        return pd.DataFrame()
+        
+    try:
+        data = response.json()
+    except Exception as e:
+        print(f"Failed to parse JSON from NOAA API for station {station_id}. Server may be down. Error: {e}")
+        return pd.DataFrame()
 
     if 'predictions' in data:
         df = pd.json_normalize(data['predictions'])
@@ -537,101 +615,6 @@ def create_survey_outline(raster_path, output_dir, title, desired_resolution=8, 
         print('Bathymetry polygon shapefile created.')
         return bathy_polygon_shp
 
-# def tides():
-#     gdf = loadCSB()
-#     print('CSB data from csv file loaded. Starting tide correction')
-
-#     zones = gpd.read_file(fp_zones)
-#     join = gpd.sjoin(gdf, zones, how='inner', predicate='within')
-#     join = join.astype({'time': 'datetime64[ns]'})
-#     join = join.sort_values('time')
-
-#     def generate_date_ranges(dates):
-#         dates.sort()
-#         date_ranges = []
-#         for date in dates:
-#             if not date_ranges or date - pd.Timedelta(days=1) > date_ranges[-1][1]:
-#                 date_ranges.append([date, date])
-#             else:
-#                 date_ranges[-1][1] = date
-#         date_ranges = [(start_date - pd.Timedelta(days=1), end_date + pd.Timedelta(days=1)) for start_date, end_date in date_ranges]
-#         return [(start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d')) for start_date, end_date in date_ranges]
-
-#     tdf = []
-#     known_subordinate_stations = set()
-#     known_great_lakes_stations = set()
-
-#     for station_id in join['ControlStn'].unique():
-#         station_dates = join[join['ControlStn'] == station_id]['time'].dt.floor('d').unique()
-#         date_ranges = generate_date_ranges(list(station_dates))
-
-#         for start_date, end_date in date_ranges:
-#             # Try to fetch observed data first
-#             verified_data = fetch_tide_data(station_id, start_date, end_date, product="water_level")
-#             if not verified_data.empty and not check_for_gaps(verified_data):
-#                 tdf.append(verified_data)
-#             else:
-#                 # If there are gaps, try fetching 6-minute predicted data
-#                 predicted_data = fetch_tide_data(station_id, start_date, end_date, product="predictions")
-#                 if not predicted_data.empty and not check_for_gaps(predicted_data):
-#                     tdf.append(predicted_data)
-#                 else:
-#                     # If that doesn't work, fallback to predicted hilo data
-#                     hilo_predictions = fetch_tide_data(station_id, start_date, end_date, product="predictions", interval='hilo')
-#                     if not hilo_predictions.empty:
-#                         interpolated_hilo = cosine_interpolation(hilo_predictions, start_date, end_date)
-#                         tdf.append(interpolated_hilo)
-#                         known_subordinate_stations.add(station_id)
-#                     else:
-#                         great_lakes_data = fetch_tide_data(station_id, start_date, end_date, product="water_level", attempt_great_lakes=True)
-#                         if not great_lakes_data.empty:
-#                             tdf.append(great_lakes_data)
-#                             known_great_lakes_stations.add(station_id)
-#                         else:
-#                             print(f"No water level data available for station {station_id}.")
-
-#     if tdf:
-#         tdf = pd.concat(tdf)
-#         print("Concatenated tdf shape:", tdf.shape)
-
-#         tdf = tdf.sort_values('t')
-#         jtdf = pd.merge_asof(join, tdf, left_on='time', right_on='t')
-#         print("jtdf shape before column drop:", jtdf.shape)
-
-#         columns_to_drop = ['Shape__Are', 'Shape__Len', 'Input_FID', 'id', 'name', 'state', 'affil', 
-#                            'latitude', 'longitude', 'data', 'metaapi', 'dataapi', 'Shape_Le_2']
-#         jtdf.drop(columns=columns_to_drop, inplace=True, errors='ignore')
-#         print("jtdf shape after column drop:", jtdf.shape)
-
-#         jtdf = jtdf.dropna(subset=['depth', 'time', 'geometry'])
-#         print("jtdf shape after dropna:", jtdf.shape)
-
-#         jtdf['t_corr'] = jtdf['t'] + pd.to_timedelta(jtdf['ATCorr'], unit='m')
-
-#         newdf = jtdf[['t_corr', 'v']].copy()
-#         print("newdf shape before dropna:", newdf.shape)
-
-#         newdf = newdf.rename(columns={'v': 'v_new', 't_corr': 't_new'})
-#         newdf = newdf.sort_values('t_new').dropna()
-#         print("newdf shape after dropna:", newdf.shape)
-
-#         csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new', direction='nearest')
-#         print("csb_corr shape before dropna:", csb_corr.shape)
-
-#         print("csb_corr shape after dropna:", csb_corr.shape)
-
-#         csb_corr['depth_new'] = csb_corr['depth'] - (csb_corr['RR'] * csb_corr['v_new'])
-#         print("csb_corr shape after applying tide corrections:", csb_corr.shape)
-
-#         csb_corr = gpd.GeoDataFrame(csb_corr, geometry='geometry', crs='EPSG:4326')
-#         csb_corr['time'] = csb_corr['time'].dt.strftime("%Y%m%d %H:%M:%S")
-
-#         csb_corr = csb_corr[(csb_corr['depth'] > 1.5) & (csb_corr['depth'] < 1000)]
-#         csb_corr = csb_corr.rename(columns={'depth': 'depth_old'}).drop(columns=['index_right', 'ATCorr', 'RR', 'ATCorr2', 'RR2', 'Shape_Leng', 'Shape_Area', 'Shape_Le_1', 't', 'v', 't_corr', 't_new', 'v_new'])
-#         return csb_corr
-#     else:
-#         print("No tide data available for the specified period.")
-#         return pd.DataFrame()
 
 def tides():
     gdf = loadCSB()
@@ -744,77 +727,6 @@ def tides():
     
     return csb_corr
 
-
-# def BAGextract():
-#     print("starting BAGextract() function")
-#     global BAG_filepath
-#     BAG_filepath = os.path.abspath(BAG_filepath)  # Ensure it's an absolute path
-#     print("DEBUG - BAG_filepath:", BAG_filepath)
-#     print('*****Starting to import BAG bathy and aggregate to 8m geotiff*****')
-
-#     # Translate options and creation of multi-band GeoTIFF
-#     translate_options = gdal.TranslateOptions(bandList=[1, 2], creationOptions=['COMPRESS=LZW'])
-#     intermediate_raster_path = output_dir + '/' + title + '_intermediate.tif'
-
-#     dataset = gdal.Open(BAG_filepath, gdal.GA_ReadOnly)
-#     if dataset is None:
-#         print("Error: Unable to open the file. Check the file path.")
-#         return None, None
-
-#     gdal.Translate(intermediate_raster_path, dataset, options=translate_options)
-
-#     # Check the CRS
-#     crs = osr.SpatialReference(wkt=dataset.GetProjection())
-#     dataset = None  # Close the dataset
-
-#     if crs.IsGeographic():
-#         print("Reprojecting GeoTIFF to a projected CRS...")
-#         reprojected_raster_path = output_dir + '/' + title + '_reprojected.tif'
-#         gdal.Warp(reprojected_raster_path, intermediate_raster_path, dstSRS='EPSG:3395', creationOptions=['COMPRESS=LZW'])
-#         intermediate_raster_path = reprojected_raster_path
-
-#     # Open the intermediate raster to check its resolution
-#     with rasterio.open(intermediate_raster_path) as src:
-#         res_x, res_y = src.res
-
-#     # Check if the resolution is coarser than 8m
-#     if max(res_x, res_y) > 8:
-#         output_raster = intermediate_raster_path
-#     else:
-#         # Resample to desired resolution
-#         output_raster_resampled = output_dir + '/' + title + '_5m_MLLW.tif'
-#         gdal.Warp(output_raster_resampled, intermediate_raster_path, xRes=8, yRes=8, creationOptions=['COMPRESS=LZW'])
-#         output_raster = output_raster_resampled
-#         # Clean up intermediate file
-#         os.remove(intermediate_raster_path)
-
-#     # Replace NaN values and update nodata value in the raster
-#     with rasterio.open(output_raster) as src:
-#         data = src.read()
-#         meta = src.meta
-
-#     data = np.where(np.isnan(data), 1000000, data)
-#     meta.update(nodata=1000000)
-
-#     with rasterio.open(output_raster, 'w', **meta) as dst:
-#         dst.write(data)
-
-#     # Reproject the raster to WGS84
-#     output_raster_wgs84 = output_dir + '/' + title + '_wgs84.tif'
-#     gdal.Warp(output_raster_wgs84, output_raster, dstSRS='EPSG:4326', creationOptions=['COMPRESS=LZW'])
-
-#     # Call create_survey_outline to generate the bathymetry polygon shapefile
-#     bathy_polygon_shp = create_survey_outline(output_raster_wgs84, output_dir, title)
-
-#     # Clean up intermediate files
-#     try:
-#         os.remove(intermediate_raster_path)
-#         os.remove(output_raster_resampled)
-#         os.remove(output_raster_wgs84)
-#     except Exception:
-#         pass
-
-#     return output_raster_wgs84, bathy_polygon_shp
 def BAGextract():
     print("starting BAGextract() function")
     global BAG_filepath
@@ -822,34 +734,30 @@ def BAGextract():
     print("DEBUG - BAG_filepath:", BAG_filepath)
     print('*****Starting to import reference bathy*****')
 
-    output_raster_wgs84 = os.path.join(output_dir, title + '_wgs84.tif')
+    # CHANGED: Use .vrt instead of .tif
+    output_raster_wgs84 = os.path.join(output_dir, title + '_wgs84.vrt') 
     temp_vrt_path = os.path.join(output_dir, 'temp_for_warp.vrt')
 
-    print("Warping input raster to standard WGS84 (EPSG:4269)...")
+    print("Warping input raster to standard WGS84 (EPSG:4326) as VRT...")
     
     input_for_warp = BAG_filepath
     
-    # --- CORRECTED LOGIC for BAG Files ---
-    # For BAG files, we first create a VRT to select the depth and uncertainty bands
     if BAG_filepath.lower().endswith('.bag'):
         print("BAG file detected, creating temporary VRT to select bands 1 and 2...")
-        # gdal.BuildVRT is the correct place to use bandList
         gdal.BuildVRT(temp_vrt_path, BAG_filepath, bandList=[1, 2])
         input_for_warp = temp_vrt_path
 
-    # The gdal.Warp function no longer has the incorrect 'bandList' argument
+    # CHANGED: Added format='VRT' and removed TIFF creationOptions
     gdal.Warp(output_raster_wgs84, input_for_warp,
+              format='VRT', 
               dstSRS='EPSG:4326',
-              creationOptions=['COMPRESS=LZW'],
               dstNodata=1000000)
 
-    # Clean up the temporary VRT file if it was created
     if os.path.exists(temp_vrt_path):
         os.remove(temp_vrt_path)
 
     print("Reference raster prepared successfully.")
 
-    # Call create_survey_outline to generate the bathymetry polygon shapefile
     bathy_polygon_shp = create_survey_outline(output_raster_wgs84, output_dir, title)
 
     return output_raster_wgs84, bathy_polygon_shp
@@ -937,135 +845,6 @@ def get_raster_values_vectorized(coords, raster_path, batch_size=100000):
     return processed_samples
         
 
-# def derive_draft(master_offsets_df): # MODIFIED: Accept DataFrame
-#     output_raster, raster_boundary_shp = BAGextract()
-#     csb_corr = tides()
-
-#     # --- NEW: Get a list of vessels that already have an offset ---
-#     vessels_with_offsets = master_offsets_df['unique_id'].unique().tolist()
-#     print(f"Found {len(vessels_with_offsets)} vessels with pre-existing offsets.")
-
-#     # Read and fix geometries in the raster boundary and CSB data
-#     raster_boundary = gpd.read_file(raster_boundary_shp)
-#     raster_boundary['geometry'] = raster_boundary['geometry'].apply(
-#         lambda geom: geom if geom.is_valid else geom.buffer(0)
-#     )
-#     csb_corr['geometry'] = csb_corr['geometry'].apply(
-#         lambda geom: geom if geom.is_valid else geom.buffer(0)
-#     )
-#     csb_corr['row_id'] = range(len(csb_corr))
-    
-#     # Compute the unary union of the raster boundary geometries once
-#     boundary_union = raster_boundary.geometry.unary_union
-    
-#     # Get the bounding box of the boundary_union: (minx, miny, maxx, maxy)
-#     bbox = boundary_union.bounds
-    
-#     # Use the spatial index to find candidate points that intersect the bbox
-#     possible_matches_index = csb_corr.sindex.query(boundary_union, predicate="intersects")
-#     possible_matches = csb_corr.iloc[possible_matches_index]
-    
-#     # Now apply the precise .within() filter on this subset
-#     csb_corr_subset = possible_matches[possible_matches.geometry.within(boundary_union)]
-    
-#     # --- MODIFIED: Filter out vessels that already have an offset ---
-#     csb_for_offset_derivation = csb_corr_subset[~csb_corr_subset['unique_id'].isin(vessels_with_offsets)]
-    
-#     if csb_for_offset_derivation.empty:
-#         print("All vessels within reference data already have offsets. Skipping new offset calculation.")
-#         # We still need to sample the raster for all points for post-processing diff calculation
-#         # So we continue, but the offset derivation part will be skipped.
-#     else:
-#         print(f"Found {csb_for_offset_derivation['unique_id'].nunique()} new vessels requiring offset derivation.")
-
-#     # Instead of sampling 1000 points per vessel, use all points.
-#     sampled_csb_corr_subset = csb_corr_subset.copy()
-    
-#     # Compute date ranges for each vessel (unique_id) using all available points.
-#     date_ranges = {}
-#     for name, group in csb_corr_subset.groupby('unique_id'):
-#         # Ensure time is in datetime format.
-#         group['time'] = pd.to_datetime(group['time'])
-#         min_timestamp = group['time'].min()
-#         max_timestamp = group['time'].max()
-#         if pd.notnull(min_timestamp) and pd.notnull(max_timestamp):
-#             date_ranges[name] = (min_timestamp.strftime('%Y%m%d'), max_timestamp.strftime('%Y%m%d'))
-#         else:
-#             date_ranges[name] = ("19700101", "19700101")
-
-#     # Use the new vectorized raster sampling function over all points.
-#     try:
-#         # Extract (x, y) coordinates from the GeoDataFrame.
-#         coords = [(geom.x, geom.y) for geom in sampled_csb_corr_subset.geometry]
-#         # Get raster values (supports batching if needed).
-#         raster_samples = get_raster_values_vectorized(coords, output_raster)
-#         # Assuming the raster has two bands: assign first as Raster_Value and second as Uncertainty_Value.
-#         sampled_csb_corr_subset['Raster_Value'] = [vals[0] for vals in raster_samples]
-#         sampled_csb_corr_subset['Uncertainty_Value'] = [
-#             vals[1] if len(vals) > 1 else np.nan for vals in raster_samples
-#         ]
-#     except KeyError as e:
-#         print(f"KeyError encountered during selection of Raster_Value from reference bathy: {e}")
-#     except Exception as e:
-#         print(f"Unexpected error encountered during selection of Raster_Value from reference bathy: {e}")
-
-#     # Merge the new raster values back into the main CSB dataframe.
-#     try:
-#         csb_corr = csb_corr.merge(
-#             sampled_csb_corr_subset[['row_id', 'Raster_Value', 'Uncertainty_Value']],
-#             on='row_id', how='left'
-#         )
-#     except KeyError as e:
-#         print(f"KeyError encountered during merging: {e}")
-#     except Exception as e:
-#         print(f"Unexpected error encountered during merging: {e}")
-
-#     # --- MODIFIED: Use the filtered DataFrame for offset derivation ---
-#     # Filter based on uncertainty threshold.
-#     filtered_csb_corr = csb_for_offset_derivation.merge(
-#         csb_corr[['row_id', 'Raster_Value', 'Uncertainty_Value']], on='row_id', how='left'
-#     )
-#     filtered_csb_corr = filtered_csb_corr[filtered_csb_corr['Uncertainty_Value'] < 4]
-
-#     # Calculate the tide correction difference.
-#     try:
-#         if 'Raster_Value' in filtered_csb_corr.columns and 'depth_new' in filtered_csb_corr.columns:
-#             filtered_csb_corr['diff'] = filtered_csb_corr['depth_new'] - (filtered_csb_corr['Raster_Value'] * -1)
-#     except KeyError as e:
-#         print(f"KeyError encountered calculating diff: {e}")
-#     except Exception as e:
-#         print(f"Unexpected error encountered calculating diff: {e}")
-
-#     # Aggregate differences by vessel (unique_id).
-#     if not filtered_csb_corr.empty and 'diff' in filtered_csb_corr.columns:
-#         try:
-#             out = filtered_csb_corr.groupby('unique_id')['diff'].agg(['mean', 'std', 'count']).reset_index()
-            
-#             out.loc[:, 'mean'] = out['mean'].fillna(0)
-#             out.loc[:, 'std'] = out['std'].fillna(999)
-#             out.loc[:, 'count'] = out['count'].fillna(0)
-#             out.loc[(out['mean'] > 3) | (out['mean'] < -11), ['mean', 'std', 'count']] = [0, 999, 0]
-#             out.loc[(out['std'] > 7), ['mean', 'std', 'count']] = [0, 999, 0]
-#             out.to_csv(output_dir + '/VESSEL_OFFSETS_csb_corr_' + title + '.csv', mode='a')
-
-#             platform_mapping = filtered_csb_corr[['unique_id', 'platform_name']].drop_duplicates()
-#             out_with_platform = out.merge(platform_mapping, on='unique_id', how='left')
-
-#             for index, row in out_with_platform.iterrows():
-#                 unique_id = row['unique_id']
-#                 platform_name = row['platform_name']
-#                 new_offset = row['mean']
-#                 std_dev = row['std']
-#                 date_range = date_ranges.get(unique_id, ("19700101", "19700101"))
-#                 update_master_offsets(unique_id, platform_name, new_offset, std_dev, date_range, title)
-#         except KeyError as e:
-#             print(f"KeyError encountered creating aggregation dataframe: {e}")
-#         except Exception as e:
-#             print(f"Unexpected error encountered creating aggregation dataframe: {e}")
-#     else:
-#         print("No new offsets to calculate in this run.")
-
-#     return csb_corr
 
 def derive_draft(master_offsets_df, report=None): # Added report default for safety
     output_raster, raster_boundary_shp = BAGextract()
@@ -1124,7 +903,6 @@ def derive_draft(master_offsets_df, report=None): # Added report default for saf
         on='row_id', how='left'
     )
 
-    # --- THIS IS THE MODIFIED LINE ---
     # Keep rows if Uncertainty < 4 OR if Uncertainty is missing (NaN).
     filtered_csb_corr = csb_corr[(csb_corr['Uncertainty_Value'] < 4) | (csb_corr['Uncertainty_Value'].isna())]
     
@@ -1222,6 +1000,22 @@ def rasterize_with_rasterio(geodataframe, output_path, resolution=50, nodatavalu
             transform=transform,
             fill=nodatavalue
         ), 1)
+        
+def get_utm_zone_wgs84(lat, lon):
+    """
+    Calculates the WGS84 UTM zone EPSG code for a given latitude and longitude.
+    This function correctly handles both Northern and Southern hemispheres.
+    """
+    zone_number = int((lon + 180) // 6) + 1
+    
+    # Southern hemisphere EPSG codes are in the 327xx range
+    if lat < 0:
+        epsg_code = 32700 + zone_number
+    # Northern hemisphere EPSG codes are in the 326xx range
+    else:
+        epsg_code = 32600 + zone_number
+        
+    return epsg_code
 
 def get_utm_zone_nad83(lat, lon):
     """
@@ -1364,7 +1158,7 @@ def run_apply_best_offsets(db_path):
         if 'uncertainty_hori' not in columns_df['column_name'].values:
             con.execute("ALTER TABLE csb ADD COLUMN uncertainty_hori DOUBLE;")
 
-        # --- MODIFIED: Apply offsets only to new rows where depth_mod IS NULL ---
+
         print("Applying best offsets to new data...")
         con.execute("""
         UPDATE csb
@@ -1387,7 +1181,7 @@ def run_apply_best_offsets(db_path):
         con.execute(update_query)
         print("Updated remaining depth_mod values with initial depthfinal.")
 
-        # --- MODIFIED: Calculate uncertainty only for new rows ---
+        # Calculate uncertainty only for new rows ---
         print("Calculating CATZOC uncertainty for new data...")
         uncert_vert_query = "UPDATE csb SET uncertainty_vert = (2 + (depth_mod * -0.05)) WHERE uncertainty_vert IS NULL"
         uncert_hori_query = "UPDATE csb SET uncertainty_hori = 10 WHERE uncertainty_hori IS NULL"
@@ -1513,7 +1307,7 @@ def run_export_transits(db_path, exports_folder):
         if 'vessel_speed_smoothed' not in columns_df['column_name'].values:
             con.execute("ALTER TABLE csb ADD COLUMN vessel_speed_smoothed DOUBLE;")
 
-        # --- MODIFIED: Get unique_ids ONLY from unprocessed data ---
+        # Get unique_ids ONLY from unprocessed data
         unprocessed_ids_query = "SELECT DISTINCT unique_id FROM csb WHERE transit_id IS NULL"
         unique_ids = con.execute(unprocessed_ids_query).fetchall()
         unique_ids = [x[0] for x in unique_ids]
@@ -1527,7 +1321,7 @@ def run_export_transits(db_path, exports_folder):
 
         for i, unique_id in enumerate(unique_ids, start=1):
             print(f"\nProcessing new data for unique_id {i}/{len(unique_ids)}: {unique_id}")
-            # --- MODIFIED: Query ONLY unprocessed data for the current vessel ---
+            # Query ONLY unprocessed data for the current vessel
             query = f"""
             SELECT
                 rowid, unique_id, platform_name_x AS platform_name, time,
@@ -1702,7 +1496,7 @@ def points_to_raster_average(gdf, out_raster_path, value_col='depth', nodata=100
             sum_array[row, col]   += value
             count_array[row, col] += 1
 
-    # --- NEW: Safer method to calculate the average and avoid division by zero ---
+    # method to calculate the average and avoid division by zero 
     # Create an output array filled with the nodata value by default
     avg_array = np.full((height, width), nodata, dtype=np.float32)
     
@@ -1722,6 +1516,51 @@ def points_to_raster_average(gdf, out_raster_path, value_col='depth', nodata=100
         dst.write(avg_array, 1)
 
     print(f"Final gridded GeoTIFF created at {out_raster_path}")
+
+def points_to_raster_density(gdf, out_raster_path, resolution=200, nodata=-1):
+    """
+    Creates a GeoTIFF representing point density (count of points per grid cell).
+    """
+    if gdf.crs is None:
+        raise ValueError("GeoDataFrame has no CRS. Please set or reproject first.")
+
+    output_dir = os.path.dirname(out_raster_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    x_min, y_min, x_max, y_max = gdf.total_bounds
+    width = int(np.ceil((x_max - x_min) / resolution))
+    height = int(np.ceil((y_max - y_min) / resolution))
+
+    if width <= 0 or height <= 0:
+        print(f"Warning: Raster dimensions are zero or negative for {os.path.basename(out_raster_path)}. Skipping.")
+        return
+
+    transform = from_origin(x_min, y_max, resolution, resolution)
+
+    # Use a standard integer array to count the points
+    count_array = np.zeros((height, width), dtype=np.int32)
+
+    for geom in gdf.geometry:
+        if geom is None:
+            continue
+        col = int((geom.x - x_min) // resolution)
+        row = int((y_max - geom.y) // resolution)
+        if 0 <= col < width and 0 <= row < height:
+            count_array[row, col] += 1
+
+    # Replace 0 count with nodata so the empty areas are transparent in GIS
+    out_array = np.where(count_array == 0, nodata, count_array).astype(np.float32)
+
+    with rasterio.open(
+            out_raster_path, 'w', driver='GTiff',
+            height=height, width=width, count=1,
+            dtype=np.float32, crs=gdf.crs.to_string(),
+            transform=transform, nodata=nodata,
+            compress='lzw'
+    ) as dst:
+        dst.write(out_array, 1)
+
+    print(f"Density raster created at {out_raster_path}")
 
 def organize_by_epsg(input_dir):
     """
@@ -1783,7 +1622,6 @@ def create_vrts_for_epsg_folders(base_dir):
                 ds = None
                 print(f"Overviews built for {vrt_filename}")
 
-
 def run_final_gridding_and_export():
     """
     Main function for the final gridding and export stage.
@@ -1792,7 +1630,9 @@ def run_final_gridding_and_export():
     db_path = os.path.join(output_dir, "csb.duckdb")
     tessellation_shp = tessellation_shp_var.get()
     output_folder = os.path.join(output_dir, "final_products")
+    density_folder = os.path.join(output_folder, "density_grids")
     os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(density_folder, exist_ok=True)
     with duckdb.connect(database=db_path, read_only=False) as con:
         if tessellation_shp and os.path.exists(tessellation_shp):
             print(f"Using tessellation scheme: {tessellation_shp}")
@@ -1813,16 +1653,8 @@ def run_final_gridding_and_export():
                     WHERE (lat BETWEEN {miny} AND {maxy} AND lon BETWEEN {minx} AND {maxx})
                     AND (Raster_Value IS NULL OR ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 3.5))
                 """
-                query = f"""
-                    SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                    platform_name_x as platform_name, time, uncertainty_vert
-                    FROM csb
-                    WHERE (lat BETWEEN {miny} AND {maxy} AND lon BETWEEN {minx} AND {maxx})
-                    AND (Raster_Value IS NULL OR ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100))
-                """
                 df_points = con.execute(query).df()
                 
-
                 print(f"  Found {len(df_points)} points within the bounding box that passed the quality filter.")
 
                 if df_points.empty:
@@ -1836,7 +1668,6 @@ def run_final_gridding_and_export():
 
                 points_gdf_4326 = points_gdf_4326[points_gdf_4326.geometry.within(poly_geom)]
                 
-
                 print(f"  {len(points_gdf_4326)} points remain after precise clipping to the polygon.")
 
                 if points_gdf_4326.empty:
@@ -1850,16 +1681,20 @@ def run_final_gridding_and_export():
 
                 lat_c, lon_c = poly_geom.centroid.y, poly_geom.centroid.x
                 try:
-                    epsg_zone = get_utm_zone_nad83(lat_c, lon_c)
+                    # --- UPDATED FUNCTION CALL in tiled workflow ---
+                    epsg_zone = get_utm_zone_wgs84(lat_c, lon_c)
                     points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
                     
-                    points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
-
+                    # points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
+                    points_for_raster = points_gdf_utm
+                    
                     print(f"  Found {len(points_for_raster)} non-outlier points to create raster from.")
 
                     if not points_for_raster.empty:
                         tif_path = os.path.join(output_folder, f"{polygon_id}_gridded.tif")
                         points_to_raster_average(points_for_raster, tif_path, value_col='depth')
+                        density_tif_path = os.path.join(density_folder, f"{polygon_id}_density_200m.tif")
+                        points_to_raster_density(points_for_raster, density_tif_path, resolution=200)
                 except ValueError as e:
                     print(f"  Skipping raster for {polygon_id}: {e}")
                     continue
@@ -1875,17 +1710,7 @@ def run_final_gridding_and_export():
                     OR 
                     ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 3.5)
             """
-            query = """
-                SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                platform_name_x as platform_name, time, uncertainty_vert 
-                FROM csb 
-                WHERE 
-                    Raster_Value IS NULL 
-                    OR 
-                    ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100)
-            """
             df_points = con.execute(query).df()
-
 
             print(f"Initial query returned {len(df_points)} points from the database.")
 
@@ -1908,17 +1733,20 @@ def run_final_gridding_and_export():
             
             try:
                 world_centroid = points_gdf_4326.unary_union.centroid
-                epsg_zone = get_utm_zone_nad83(world_centroid.y, world_centroid.x)
-                print(f"Determined overall EPSG zone for raster as: {epsg_zone}")
-                points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
+                # --- THIS IS THE UPDATED FUNCTION CALL ---
+                epsg_code = get_utm_zone_wgs84(world_centroid.y, world_centroid.x)
+                print(f"Determined overall EPSG zone for raster as: {epsg_code}")
+                points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_code)
                 
-                points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
-
+                # points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
+                points_for_raster = points_gdf_utm
                 print(f"Found {len(points_for_raster)} non-outlier points to create raster from.")
 
                 if not points_for_raster.empty:
                     tif_path = os.path.join(output_folder, "csb_final_gridded.tif")
                     points_to_raster_average(points_for_raster, tif_path, value_col='depth')
+                    density_tif_path = os.path.join(density_folder, "csb_final_density_200m.tif")
+                    points_to_raster_density(points_for_raster, density_tif_path, resolution=200)
                 else:
                     print("No valid non-outlier points to create final raster.")
                 
@@ -1928,9 +1756,12 @@ def run_final_gridding_and_export():
     if organize_vrt_var.get():
         organize_by_epsg(output_folder)
         create_vrts_for_epsg_folders(output_folder)
+        print("\nProcessing Density VRTs...")
+        organize_by_epsg(density_folder)
+        create_vrts_for_epsg_folders(density_folder)
+
 
     print("***** Final Gridding & Export Stage Complete *****")
-
 
 def cleanup_interim_files(output_dir, title):
     """
@@ -1954,7 +1785,7 @@ def cleanup_interim_files(output_dir, title):
     # List of file patterns to remove
     file_patterns_to_remove = [
         os.path.join(output_dir, f"{title}_5m_MLLW.tif"),
-        os.path.join(output_dir, f"{title}_wgs84.tif"),
+        os.path.join(output_dir, f"{title}_wgs84.vrt"),
         os.path.join(output_dir, f"{title}_intermediate.tif"),
         os.path.join(output_dir, "convex_hull_polygon.*"),
         os.path.join(output_dir, f"{title}_bathy_polygon.*")
@@ -1994,12 +1825,13 @@ def process_csb_for_directory(csb_directory, root_window):
     csb = csb_var.get()
     fp_zones = fp_zones_var.get()
     output_dir = output_dir_var.get()
+    setup_logging(output_dir)
     csb_directory = os.path.abspath(csb_directory)
     fp_zones = os.path.abspath(fp_zones)
     output_dir = os.path.abspath(output_dir)
     print(f"output_dir is: {output_dir}")
 
-    # --- NEW: Load master offsets once at the start ---
+    # --- Load master offsets once at the start ---
     MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
     if os.path.exists(MASTER_OFFSET_FILE):
         print(f"Found existing master offsets file at: {MASTER_OFFSET_FILE}")
@@ -2033,7 +1865,7 @@ def process_csb_for_directory(csb_directory, root_window):
             else:
                 BAG_filepath = BAG_filepath_var.get()
             
-            # --- MODIFIED: Pass the master_offsets_df to rasterize_CSB ---
+            # ---Pass the master_offsets_df to rasterize_CSB ---
             rasterize_CSB(master_offsets_df)
             
         except Exception as e:
@@ -2068,10 +1900,7 @@ def process_csb_for_directory(csb_directory, root_window):
 # --- GUI SETUP ---
 root = tk.Tk()
 root.title("CSB Processing Pipeline")
-root.geometry("900x750")
-
-# --- Add this to the FES section of your "options_frame" ---
-# Place it right below the FES Model Data Path
+root.geometry("975x750")
 
 
 # --- Main Frame ---
@@ -2089,6 +1918,7 @@ export_final_gpkg_var=tk.BooleanVar(value=True)
 fes_model_var = tk.BooleanVar(value=False)
 fes_path_var = tk.StringVar()
 fes_yaml_var = tk.StringVar()
+
 
 
 # BooleanVars for options
@@ -2131,57 +1961,11 @@ BAG_filepath_entry = ttk.Entry(ref_bathy_frame, textvariable=BAG_filepath_var, w
 BAG_filepath_entry.grid(row=1, column=1)
 ttk.Button(ref_bathy_frame, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG or GeoTIFF file", "*.bag;*.tif;*.tiff")])).grid(row=1, column=2, padx=5)
 
-# # --- Processing Options Section ---
-# options_frame = ttk.LabelFrame(main_frame, text="3. Processing & Export Options", padding="10")
-# options_frame.pack(fill=tk.X, expand=True, pady=5)
-
-# ttk.Checkbutton(options_frame, text="Insert into DuckDB (Required for all post-processing)", variable=duckdb_option_var).grid(row=0, column=0, columnspan=2, sticky='w', padx=5)
-# ttk.Checkbutton(options_frame, text="Export Initial Processed Geopackage (per input file)", variable=export_gp_var).grid(row=1, column=0, columnspan=2, sticky='w', padx=5)
-# ttk.Separator(options_frame, orient='horizontal').grid(row=2, columnspan=3, sticky='ew', pady=5)
-
-# # Post-Processing Options
-# ttk.Checkbutton(options_frame, text="Run Post-Processing (Outlier Flagging, etc.)", variable=run_analysis_var).grid(row=3, column=0, columnspan=2, sticky='w', padx=5)
-# export_transits_checkbox = ttk.Checkbutton(options_frame, text="Export Individual Transit Files (GPKG & GeoTIFF)", variable=export_transits_var)
-# export_transits_checkbox.grid(row=4, column=0, sticky='w', padx=25)
-# ttk.Separator(options_frame, orient='horizontal').grid(row=5, columnspan=3, sticky='ew', pady=5)
-
-# # Add a separator and the new FES options
-# ttk.Separator(options_frame, orient='horizontal').grid(row=5, columnspan=3, sticky='ew', pady=5) # Adjust row number if needed
-
-# fes_checkbox = ttk.Checkbutton(options_frame, text="Use Global FES Tide Model (for non-US waters)", variable=fes_model_var)
-# fes_checkbox.grid(row=6, column=0, columnspan=2, sticky='w', padx=5) # Adjust row number
-
-# ttk.Label(options_frame, text='FES Model Data Path').grid(row=7, column=0, sticky='w', padx=25) # Adjust row
-# fes_path_entry = ttk.Entry(options_frame, textvariable=fes_path_var, width=45)
-# fes_path_entry.grid(row=7, column=1, sticky='w') # Adjust row
-# fes_path_button = ttk.Button(options_frame, text='Browse', command=lambda: open_folder_dialog(fes_path_var))
-# fes_path_button.grid(row=7, column=2, padx=5) # Adjust row
-
-# # Final Gridding Options
-# final_grid_checkbox = ttk.Checkbutton(options_frame, text="Run Final Gridding & Export", variable=run_final_grid_var)
-# final_grid_checkbox.grid(row=6, column=0, sticky='w', padx=5)
-
-# gpkg_export_checkbox=ttk.Checkbutton(options_frame, text="Export Final Points GeoPackage (in epsg:4326)", variable=export_final_gpkg_var)
-# gpkg_export_checkbox.grid(row=7,column=0,columnspan=2,sticky='w',padx=25)
-
-# ttk.Label(options_frame, text='Optional Tessellation Shapefile').grid(row=8, column=0, sticky='w', padx=25)
-# tess_entry = ttk.Entry(options_frame, textvariable=tessellation_shp_var, width=45)
-# tess_entry.grid(row=8, column=1, sticky='w')
-# tess_button = ttk.Button(options_frame, text='Browse', command=lambda: open_file_dialog(tessellation_shp_var, [("Shapefile", "*.shp")]))
-# tess_button.grid(row=8, column=2, padx=5)
-
-# ttk.Label(options_frame, text='Grid Resolution (meters)').grid(row=9, column=0, sticky='w', padx=25)
-# res_entry = ttk.Entry(options_frame, textvariable=grid_resolution_var, width=10)
-# res_entry.grid(row=9, column=1, sticky='w')
-
-# organize_vrt_checkbox = ttk.Checkbutton(options_frame, text="Organize GeoTIFFs by EPSG and Create VRTs", variable=organize_vrt_var)
-# organize_vrt_checkbox.grid(row=10, column=0, columnspan=2, sticky='w', padx=25)
 
 # --- Processing Options Section ---
 options_frame = ttk.LabelFrame(main_frame, text="3. Processing & Export Options", padding="10")
 options_frame.pack(fill=tk.X, expand=True, pady=5)
 
-# --- NEW: Initialize a row counter ---
 row_num = 0
 
 ttk.Checkbutton(options_frame, text="Insert into DuckDB (Required for all post-processing)", variable=duckdb_option_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
@@ -2205,7 +1989,7 @@ row_num += 1
 ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
 row_num += 1
 
-fes_checkbox = ttk.Checkbutton(options_frame, text="Use Global FES Tide Model (for non-US waters)", variable=fes_model_var)
+fes_checkbox = ttk.Checkbutton(options_frame, text="Use FES Tide Model (for non-US waters) - user must download AVISO FES2022b ocean_tide model from AVISO website", variable=fes_model_var)
 fes_checkbox.grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
 row_num += 1
 
