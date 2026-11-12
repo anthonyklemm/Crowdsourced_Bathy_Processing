@@ -559,7 +559,7 @@ def cosine_interpolation(df, start_date, end_date):
     
     # Trimming
     trim_start = pd.to_datetime(start_date) + pd.Timedelta(hours=12)
-    trim_end = pd.to_datetime(end_date) - pd.Timedelta(hours=12)
+    trim_end = pd.to_datetime(end_date) + pd.Timedelta(hours=12)
     trimmed_df = pd.DataFrame({'t': time_grid, 'v': v_grid})
     trimmed_df = trimmed_df[(trimmed_df['t'] >= trim_start) & (trimmed_df['t'] <= trim_end)]
     #print(trimmed_df)
@@ -672,23 +672,23 @@ def tides():
                 # Try to fetch observed data first
                 verified_data = fetch_tide_data(station_id, start_date, end_date, product="water_level")
                 if not verified_data.empty and not check_for_gaps(verified_data):
-                    tdf.append(verified_data)
+                    tdf.append(verified_data.assign(tide_station=str(station_id)))
                 else:
                     # If there are gaps, try fetching 6-minute predicted data
                     predicted_data = fetch_tide_data(station_id, start_date, end_date, product="predictions")
                     if not predicted_data.empty and not check_for_gaps(predicted_data):
-                        tdf.append(predicted_data)
+                        tdf.append(predicted_data.assign(tide_station=str(station_id)))
                     else:
                         # If that doesn't work, fallback to predicted hilo data
                         hilo_predictions = fetch_tide_data(station_id, start_date, end_date, product="predictions", interval='hilo')
                         if not hilo_predictions.empty:
                             interpolated_hilo = cosine_interpolation(hilo_predictions, start_date, end_date)
-                            tdf.append(interpolated_hilo)
+                            tdf.append(interpolated_hilo.assign(tide_station=str(station_id)))
                             known_subordinate_stations.add(station_id)
                         else:
                             great_lakes_data = fetch_tide_data(station_id, start_date, end_date, product="water_level", attempt_great_lakes=True)
                             if not great_lakes_data.empty:
-                                tdf.append(great_lakes_data)
+                                tdf.append(great_lakes_data.assign(tide_station=str(station_id)))
                                 known_great_lakes_stations.add(station_id)
                             else:
                                 print(f"No water level data available for station {station_id}.")
@@ -697,31 +697,13 @@ def tides():
             tdf = pd.concat(tdf)
             print("Concatenated tdf shape:", tdf.shape)
 
-            tdf = tdf.sort_values('t')
-            jtdf = pd.merge_asof(join, tdf, left_on='time', right_on='t')
-            print("jtdf shape before column drop:", jtdf.shape)
-
-            columns_to_drop = ['Shape__Are', 'Shape__Len', 'Input_FID', 'id', 'name', 'state', 'affil', 
+            # Shift the COMPLETE response series separately for each station
+            # and zone correction, then match only that group's soundings.
+            csb_corr = match_zone_tides(join, tdf)
+            columns_to_drop = ['Shape__Are', 'Shape__Len', 'Input_FID', 'id', 'name', 'state', 'affil',
                                'latitude', 'longitude', 'data', 'metaapi', 'dataapi', 'Shape_Le_2']
-            jtdf.drop(columns=columns_to_drop, inplace=True, errors='ignore')
-            print("jtdf shape after column drop:", jtdf.shape)
-
-            jtdf = jtdf.dropna(subset=['depth', 'time', 'geometry'])
-            print("jtdf shape after dropna:", jtdf.shape)
-
-            jtdf['t_corr'] = jtdf['t'] + pd.to_timedelta(jtdf['ATCorr'], unit='m')
-
-            newdf = jtdf[['t_corr', 'v']].copy()
-            print("newdf shape before dropna:", newdf.shape)
-
-            newdf = newdf.rename(columns={'v': 'v_new', 't_corr': 't_new'})
-            newdf = newdf.sort_values('t_new').dropna()
-            print("newdf shape after dropna:", newdf.shape)
-
-            csb_corr = pd.merge_asof(jtdf, newdf, left_on='time', right_on='t_new', direction='nearest')
-            print("csb_corr shape before dropna:", csb_corr.shape)
-
-            print("csb_corr shape after dropna:", csb_corr.shape)
+            csb_corr.drop(columns=columns_to_drop, inplace=True, errors='ignore')
+            csb_corr = csb_corr.dropna(subset=['depth', 'time', 'geometry'])
 
             csb_corr['depth_new'] = csb_corr['depth'] - (csb_corr['RR'] * csb_corr['v_new'])
             print("csb_corr shape after applying tide corrections:", csb_corr.shape)
@@ -730,11 +712,13 @@ def tides():
             csb_corr['time'] = csb_corr['time'].dt.strftime("%Y%m%d %H:%M:%S")
 
             csb_corr = csb_corr[(csb_corr['depth'] > 1.5) & (csb_corr['depth'] < 1000)]
-            csb_corr = csb_corr.rename(columns={'depth': 'depth_old'}).drop(columns=['index_right', 'ATCorr', 'RR', 'ATCorr2', 'RR2', 'Shape_Leng', 'Shape_Area', 'Shape_Le_1', 't', 'v', 't_corr', 't_new', 'v_new'])
+            csb_corr = csb_corr.rename(columns={'depth': 'depth_old'}).drop(columns=['index_right', 'ATCorr', 'RR', 'ATCorr2', 'RR2', 'Shape_Leng', 'Shape_Area', 'Shape_Le_1', 't', 'v', 't_corr', 't_new', 'v_new'], errors='ignore')
         else:
-            print("No tide data available for the specified period.")
-            # Return an empty DataFrame but with columns expected by later steps to avoid errors
-            csb_corr = pd.DataFrame(columns=gdf.columns.tolist() + ['depth_old', 'depth_new'])
+            if not join.empty:
+                raise ValueError("No tide data available for soundings in the selected tide zones")
+            csb_corr = gdf.iloc[:0].copy()
+            csb_corr['depth_new'] = pd.Series(dtype=float)
+            csb_corr = csb_corr.rename(columns={'depth': 'depth_old'})
     
     return csb_corr
 
@@ -1912,6 +1896,89 @@ def process_csb_for_directory(csb_directory, root_window):
     print("processing complete. closing application window.")
     root_window.destroy()
 
+
+def match_zone_tides(soundings, tides, max_time_gap="1h"):
+    """Attach v_new and t_new without mixing stations or zone time shifts.
+
+    soundings must contain time, ControlStn and ATCorr (minutes). tides must
+    contain t, v and tide_station; tag every API response with the requested
+    station before concatenating responses. RR remains on the sounding and is
+    applied by the caller, as in the original processing script.
+
+    Positive ATCorr shifts the station series later, preserving the original
+    sign convention. Match nearest samples; do not introduce new interpolation.
+    Require bracketing series coverage and a nearest sample within one hour
+    (the existing pipeline's internal-gap threshold). Fail instead of quietly
+    assigning another station or extrapolating beyond available coverage.
+    """
+    required = {"time", "ControlStn", "ATCorr"}
+    if not required.issubset(soundings.columns):
+        raise ValueError(f"Missing sounding columns: {sorted(required - set(soundings.columns))}")
+    required = {"t", "v", "tide_station"}
+    if not required.issubset(tides.columns):
+        raise ValueError(f"Missing tide columns: {sorted(required - set(tides.columns))}")
+    if soundings.empty:
+        return soundings.assign(t_new=pd.NaT, v_new=np.nan)
+
+    # Work on copies and restore row order by position, including repeated
+    # GeoDataFrame indices caused by spatial joins.
+    left = soundings.reset_index(drop=True).copy()
+    left["_tide_row_order"] = np.arange(len(left))
+    left["time"] = pd.to_datetime(left["time"], errors="raise")
+    left["ATCorr"] = pd.to_numeric(left["ATCorr"], errors="raise")
+    if left[["time", "ControlStn", "ATCorr"]].isna().any().any():
+        raise ValueError("Soundings have missing times, control stations or zone time corrections")
+    if not np.isfinite(left["ATCorr"]).all():
+        raise ValueError("Zone time corrections must be finite")
+    left["_tide_station_key"] = left["ControlStn"].astype(str)
+
+    right = tides[["t", "v", "tide_station"]].copy()
+    right["t"] = pd.to_datetime(right["t"], errors="raise")
+    right["v"] = pd.to_numeric(right["v"], errors="coerce")
+    right = right.dropna(subset=["t", "v", "tide_station"])
+    right = right[np.isfinite(right["v"])]
+    right["tide_station"] = right["tide_station"].astype(str)
+    tolerance = pd.Timedelta(max_time_gap)
+    if tolerance <= pd.Timedelta(0):
+        raise ValueError("max_time_gap must be positive")
+
+    results = []
+    for (station, offset), group in left.groupby(
+        ["_tide_station_key", "ATCorr"], sort=False
+    ):
+        # Each group has one station and one time correction. Distinct zones
+        # with the same pair can share a lookup; RR stays specific to each row.
+        series = right.loc[right["tide_station"] == station, ["t", "v"]].copy()
+        if series.empty:
+            raise ValueError(f"No usable tide series for control station {station}")
+        # Overlapping API windows may repeat samples. Identical repeats are
+        # harmless; conflicting levels need an explicit upstream source policy.
+        if (series.groupby("t")["v"].nunique() > 1).any():
+            raise ValueError(f"Conflicting tide levels at the same time for station {station}")
+        series = series.drop_duplicates(subset="t").sort_values("t", kind="stable")
+        series["t_new"] = series["t"] + pd.to_timedelta(offset, unit="m")
+        series = series.rename(columns={"v": "v_new"})
+        group = group.drop(columns=["t_new", "v_new"], errors="ignore")
+        matched = pd.merge_asof(
+            group.sort_values("time", kind="stable"),
+            series[["t_new", "v_new"]],
+            left_on="time", right_on="t_new", direction="nearest",
+            tolerance=tolerance,
+        )
+        outside = ~matched["time"].between(series["t_new"].min(), series["t_new"].max())
+        invalid = outside | matched["v_new"].isna()
+        if invalid.any():
+            raise ValueError(
+                f"{int(invalid.sum())} sounding(s) lack usable shifted tide coverage "
+                f"for station {station}, ATCorr={offset} minutes. "
+                f"Require coverage at sounding time and a sample within {tolerance}."
+            )
+        results.append(matched)
+
+    result = pd.concat(results, ignore_index=True).sort_values("_tide_row_order")
+    result = result.drop(columns=["_tide_row_order", "_tide_station_key"])
+    result.index = soundings.index
+    return result
 
 # --- GUI SETUP ---
 root = tk.Tk()
