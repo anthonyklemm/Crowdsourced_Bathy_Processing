@@ -2099,9 +2099,12 @@ def run_final_gridding_and_export(output_folder=None):
                     epsg_zone = get_utm_zone_wgs84(lat_c, lon_c)
                     points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
                     
-                    points_for_raster = points_gdf_utm
+                    if options.analysis:
+                        points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
+                    else:
+                        points_for_raster = points_gdf_utm
                                         
-                    print(f"  Selected {len(points_for_raster)} points for raster creation (outlier filtering disabled).")
+                    print(f"  Selected {len(points_for_raster)} points for raster creation (outlier filtering: {options.analysis}).")
 
                     if not points_for_raster.empty:
                         tif_path = os.path.join(output_folder, f"{polygon_id}_gridded.tif")
@@ -2153,8 +2156,11 @@ def run_final_gridding_and_export(output_folder=None):
                 print(f"Determined overall EPSG zone for raster as: {epsg_code}")
                 points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_code)
                 
-                points_for_raster = points_gdf_utm
-                print(f"Selected {len(points_for_raster)} points for raster creation (outlier filtering disabled).")
+                if options.analysis:
+                    points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
+                else:
+                    points_for_raster = points_gdf_utm
+                print(f"Selected {len(points_for_raster)} points for raster creation (outlier filtering: {options.analysis}).")
 
                 if not points_for_raster.empty:
                     tif_path = os.path.join(output_folder, "csb_final_gridded.tif")
