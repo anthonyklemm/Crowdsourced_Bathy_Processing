@@ -1553,7 +1553,7 @@ def run_export_transits(db_path, exports_folder):
                         array[row_idx, col_idx] = value
                     dest.write(array, idx)
         except Exception as e:
-            print(f"Failed to create GeoTIFF for {filename}. Error: {str(e)}")
+            raise RuntimeError(f"Failed to create GeoTIFF for {filename}") from e
 
     def create_transit_ids(df, max_hours_gap, max_days_duration):
         df = df.sort_values(by='time')
@@ -1858,8 +1858,7 @@ def organize_by_epsg(input_dir):
             with rasterio.open(src_path) as src:
                 epsg = src.crs.to_epsg()
         except Exception as e:
-            print(f"[ERROR] could not open {fn}: {e}")
-            continue
+            raise RuntimeError(f"Could not open raster for EPSG organization: {src_path}") from e
 
         if epsg is None:
             print(f"[WARN] {fn} has no recognized EPSG code, skipping.")
@@ -1890,26 +1889,33 @@ def create_vrts_for_epsg_folders(base_dir):
             print(f"Found {len(files)} files in {directory}. Building VRT...")
             vrt_filename = os.path.join(directory, f"mosaic_{folder_name}.vrt")
             
-            gdal.BuildVRT(vrt_filename, files)
+            vrt = gdal.BuildVRT(vrt_filename, files)
+            if vrt is None:
+                raise RuntimeError(f"Failed to create VRT: {vrt_filename}")
+            vrt = None
             print("VRT created:", vrt_filename)
 
             # Build overviews
             print("Building overviews for VRT...")
             ds = gdal.Open(vrt_filename)
-            if ds:
-                gdal.SetConfigOption('COMPRESS_OVERVIEW', 'LZW')
-                ds.BuildOverviews("AVERAGE", [2,4,8,16,32,64])
-                ds = None
-                print(f"Overviews built for {vrt_filename}")
+            if ds is None:
+                raise RuntimeError(f"Failed to open VRT: {vrt_filename}")
+            gdal.SetConfigOption('COMPRESS_OVERVIEW', 'LZW')
+            result = ds.BuildOverviews("AVERAGE", [2,4,8,16,32,64])
+            ds = None
+            if result != 0:
+                raise RuntimeError(f"Failed to build overviews: {vrt_filename}")
+            print(f"Overviews built for {vrt_filename}")
 
-def run_final_gridding_and_export():
+def run_final_gridding_and_export(output_folder=None):
     """
     Main function for the final gridding and export stage.
     """
     print("\n***** Starting Final Gridding & Export Stage *****")
     db_path = os.path.join(output_dir, "csb.duckdb")
     tessellation_shp = options.tessellation
-    output_folder = os.path.join(output_dir, "final_products")
+    output_folder = output_folder or os.path.join(output_dir, "final_products")
+    expected_outputs = []
     density_folder = os.path.join(output_folder, "density_grids")
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(density_folder, exist_ok=True)
@@ -1956,6 +1962,7 @@ def run_final_gridding_and_export():
                 if options.export_final_gpkg:
                     gpkg_path = os.path.join(output_folder, f"{polygon_id}_points.gpkg")
                     print(f"  Saving {len(points_gdf_4326)} points to GeoPackage...")
+                    expected_outputs.append(gpkg_path)
                     points_gdf_4326.to_file(gpkg_path, driver="GPKG")
                     print(f"  Saved points GeoPackage (EPSG:4326): {gpkg_path}")
 
@@ -1965,19 +1972,19 @@ def run_final_gridding_and_export():
                     epsg_zone = get_utm_zone_wgs84(lat_c, lon_c)
                     points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
                     
-                    # points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
                     points_for_raster = points_gdf_utm
-                    
-                    print(f"  Found {len(points_for_raster)} non-outlier points to create raster from.")
+                                        
+                    print(f"  Selected {len(points_for_raster)} points for raster creation (outlier filtering disabled).")
 
                     if not points_for_raster.empty:
                         tif_path = os.path.join(output_folder, f"{polygon_id}_gridded.tif")
+                        expected_outputs.append(tif_path)
                         points_to_raster_average(points_for_raster, tif_path, value_col='depth')
                         density_tif_path = os.path.join(density_folder, f"{polygon_id}_density_200m.tif")
+                        expected_outputs.append(density_tif_path)
                         points_to_raster_density(points_for_raster, density_tif_path, resolution=200)
                 except ValueError as e:
-                    print(f"  Skipping raster for {polygon_id}: {e}")
-                    continue
+                    raise RuntimeError(f"Final raster failed for {polygon_id}") from e
 
         else: # This is the case for a single file output
             print("No tessellation scheme provided. Processing all data into a single file.")
@@ -1997,7 +2004,7 @@ def run_final_gridding_and_export():
             if df_points.empty:
                 print("No points passed the quality filter. Aborting final gridding.")
                 print("This can happen if all points intersected reference data but failed the quality check.")
-                return
+                raise RuntimeError("No points passed the final quality filter; run was not published.")
                 
             points_gdf_4326 = gpd.GeoDataFrame(
                 df_points,
@@ -2008,6 +2015,7 @@ def run_final_gridding_and_export():
             if options.export_final_gpkg:
                 gpkg_path = os.path.join(output_folder, "csb_final_points.gpkg")
                 print(f"Saving {len(points_gdf_4326)} points to GeoPackage...")
+                expected_outputs.append(gpkg_path)
                 points_gdf_4326.to_file(gpkg_path, driver="GPKG")
                 print(f"Saved final points GeoPackage (EPSG:4326): {gpkg_path}")
             
@@ -2018,20 +2026,25 @@ def run_final_gridding_and_export():
                 print(f"Determined overall EPSG zone for raster as: {epsg_code}")
                 points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_code)
                 
-                # points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
                 points_for_raster = points_gdf_utm
-                print(f"Found {len(points_for_raster)} non-outlier points to create raster from.")
+                print(f"Selected {len(points_for_raster)} points for raster creation (outlier filtering disabled).")
 
                 if not points_for_raster.empty:
                     tif_path = os.path.join(output_folder, "csb_final_gridded.tif")
+                    expected_outputs.append(tif_path)
                     points_to_raster_average(points_for_raster, tif_path, value_col='depth')
                     density_tif_path = os.path.join(density_folder, "csb_final_density_200m.tif")
+                    expected_outputs.append(density_tif_path)
                     points_to_raster_density(points_for_raster, density_tif_path, resolution=200)
                 else:
                     print("No valid non-outlier points to create final raster.")
                 
             except ValueError as e:
-                print(f"Could not process single file output: {e}")
+                raise RuntimeError("Final raster export failed") from e
+
+    missing = [path for path in expected_outputs if not Path(path).is_file()]
+    if not expected_outputs or missing:
+        raise RuntimeError(f"Final export produced no complete product set. Missing: {missing}")
 
     if options.organize_vrt:
         organize_by_epsg(output_folder)
@@ -2202,7 +2215,7 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
             rasterize_CSB(master_offsets_df)
             
         except Exception as e:
-            print(f"An error occurred during initial processing of {csb}: {e}")
+            raise RuntimeError(f"Initial processing failed for {csb}") from e
         finally:
             cleanup_interim_files(output_dir, title)
 
@@ -2213,7 +2226,7 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
         exports_folder = os.path.join(output_dir, "transit_exports")
 
         if not os.path.exists(db_path):
-            print(f"Error: DuckDB file not found at {db_path}. Cannot run analysis.")
+            raise FileNotFoundError(f"DuckDB file not found at {db_path}. Cannot run analysis.")
         else:
             run_histograms_calibration_points(db_path, hist_export_dir)
             run_apply_best_offsets(db_path, refresh_all=options.refresh_all_depths)
