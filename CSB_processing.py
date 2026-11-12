@@ -376,91 +376,218 @@ def mosaic_tiles(tiles_dir):
     return mosaic_raster_path
 
 
+def archive_modeling_file(source, destination, expected_sha256):
+    """Copy a verified working file into immutable version storage atomically."""
+    source, destination = Path(source), Path(destination)
+    if destination.is_file() and file_sha256(destination) == expected_sha256:
+        return str(destination)
+    if not source.is_file() or file_sha256(source) != expected_sha256:
+        raise RuntimeError(f'Missing or checksum-mismatched NOAA working file: {source}')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copyfile(source, temporary)
+        if file_sha256(temporary) != expected_sha256:
+            raise RuntimeError(f'Modeling file changed while archiving: {source}')
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(destination)
 
 
+def initialize_modeling_reference(output_root, run_path, csv_paths=()):
+    """Let NOAA update its workspace once, then freeze its catalog for this run."""
+    from nbs.bluetopo import fetch_tiles
+    import sqlite3
+    cache = Path(output_root).resolve() / 'reference'
+    workspace = cache / 'workspace'
+    workspace.mkdir(parents=True, exist_ok=True)
+    report_directory = Path(run_path).resolve() / 'reference'
+    report_directory.mkdir(parents=True, exist_ok=True)
+    # Area polygons avoid relying on polygon-intersection support for point layers.
+    # Downloads may include extra tiles; per-CSV selection still uses sounding points.
+    areas = []
+    for path in csv_paths:
+        data = pd.read_csv(path, usecols=['lon', 'lat'])
+        valid = (np.isfinite(data.lon) & np.isfinite(data.lat) &
+                 data.lon.between(-180, 180) & data.lat.between(-90, 90))
+        if data.empty or not valid.all():
+            raise ValueError(f'Empty input or invalid coordinates in Modeling coverage check: {path}')
+        from shapely.geometry import MultiPoint
+        hull = MultiPoint(np.column_stack((data.lon, data.lat))).convex_hull
+        if hull.geom_type != 'Polygon' or hull.is_empty:
+            raise ValueError(f'Cannot create a polygonal convex hull for CSV: {path} '
+                             f'(result: {hull.geom_type}).')
+        areas.append(hull)
+    area_path = None
+    if areas:
+        area_path = report_directory / 'download_area.gpkg'
+        gpd.GeoDataFrame(geometry=areas, crs=4326).to_file(area_path, driver='GPKG')
+    print(f'Updating NOAA Modeling workspace: {workspace}')
+    try:
+        downloaded, failed = fetch_tiles(str(workspace),
+                                        str(area_path) if area_path else None,
+                                        data_source='modeling')
+    except SystemExit as exc:
+        raise RuntimeError('NOAA fetch_tiles could not initialize the Modeling reference.') from exc
+    if failed:
+        raise RuntimeError(f'NOAA fetch_tiles reported missing or failed tiles: {failed}')
+    registry = workspace / 'modeling_registry.db'
+    if not registry.is_file():
+        raise RuntimeError(f'NOAA Modeling registry was not created: {registry}')
+    connection = sqlite3.connect(f'file:{registry.as_posix()}?mode=ro', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        catalog_record = connection.execute(
+            "SELECT location FROM tileset WHERE tilescheme = 'Tessellation'").fetchone()
+        working_tiles = {row['tilename']: dict(row) for row in
+                         connection.execute('SELECT * FROM tiles').fetchall()}
+    finally:
+        connection.close()
+    if catalog_record is None:
+        raise RuntimeError('NOAA registry does not identify its tile catalog.')
+    working_catalog = (workspace / catalog_record['location']).resolve()
+    working_catalog.relative_to(workspace)
+    catalog_path = report_directory / working_catalog.name
+    shutil.copyfile(working_catalog, catalog_path)
+    catalog = gpd.read_file(catalog_path)
+    required = {'tile', 'GeoTIFF_Link', 'RAT_Link', 'GeoTIFF_SHA256_Checksum', 'RAT_SHA256_Checksum'}
+    if not required.issubset(catalog.columns) or catalog.crs is None or catalog['tile'].duplicated().any():
+        raise ValueError('Invalid NOAA Modeling catalog schema, CRS, or duplicate tile IDs.')
+    context = {'catalog': catalog.to_crs(4326), 'cache': cache,
+               'workspace': workspace, 'working_tiles': working_tiles,
+               'manifest_path': report_directory / 'manifest.json',
+               'manifest': {'product': 'Modeling', 'downloader': 'nbs.bluetopo.fetch_tiles',
+                            'workspace': str(workspace), 'downloaded_tiles': list(downloaded),
+                            'catalog_path': str(catalog_path), 'catalog_sha256': file_sha256(catalog_path),
+                            'inputs': []}}
+    write_modeling_manifest(context)
+    print(f'Modeling catalog snapshot: {catalog_path}')
+    return context
 
 
+def write_modeling_manifest(context):
+    path = context['manifest_path']
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as target:
+        temporary = Path(target.name)
+        json.dump(context['manifest'], target, indent=2)
+    try:
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
+def select_modeling_tiles(csb_data_path, catalog):
+    """Match individual sounding locations, including footprint boundaries."""
+    data = pd.read_csv(csb_data_path, usecols=['lon', 'lat'])
+    valid = (np.isfinite(data.lon) & np.isfinite(data.lat) &
+             data.lon.between(-180, 180) & data.lat.between(-90, 90))
+    if not valid.all():
+        raise ValueError('Invalid sounding coordinates in Modeling coverage check.')
+    points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(data.lon, data.lat), crs=4326)
+    matches = gpd.sjoin(points, catalog[['tile', 'geometry']], how='left', predicate='intersects')
+    missing = int(matches.loc[matches['tile'].isna()].index.nunique())
+    selected = catalog[catalog['tile'].isin(matches['tile'].dropna())].sort_values('tile')
+    return selected, missing, len(data)
 
 
+def build_modeling_vrt(tile_files, destination):
+    """Rebuild from verified sources, handling different UTM zones explicitly."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    projections = []
+    for path in tile_files:
+        dataset = gdal.Open(str(path))
+        if dataset is None or dataset.RasterCount != 3:
+            raise ValueError(f'Expected three-band Modeling tile: {path}')
+        projections.append(dataset.GetProjection())
+        dataset = None
+    sources = [str(path) for path in tile_files]
+    if len(set(projections)) > 1:
+        sources = []
+        for index, path in enumerate(tile_files):
+            warped_path = destination.parent / f'source_{index}.vrt'
+            warped = gdal.Warp(str(warped_path), str(path), format='VRT',
+                               dstSRS='EPSG:4326', resampleAlg='near', multithread=False)
+            if warped is None:
+                raise RuntimeError(f'Cannot reproject Modeling tile: {path}')
+            warped = None
+            sources.append(str(warped_path))
+    temporary = destination.with_name('building.vrt')
+    vrt = gdal.BuildVRT(str(temporary), sources, strict=True)
+    if vrt is None:
+        raise RuntimeError('Cannot build Modeling reference VRT.')
+    vrt.FlushCache()
+    vrt = None
+    os.replace(temporary, destination)
+    return str(destination)
 
 
-
-
-
-
-
-def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetopo=True):
-    """
-    Loads CSB data, builds a convex hull, and writes it to a shapefile.
-    If use_bluetopo is True, it creates a dedicated Modeling folder,
-    downloads BlueTopo tiles, copies them to a separate archive folder,
-    and then builds a VRT from all GeoTIFF files found recursively in that folder.
-    If use_bluetopo is False, it returns the user‐provided BAG_filepath.
-    """
-
-    # Load CSB data and create convex hull
-    csb_data = pd.read_csv(csb_data_path)
-    gdf = gpd.GeoDataFrame(csb_data, geometry=gpd.points_from_xy(csb_data.lon, csb_data.lat))
-    gdf = gdf.set_crs(4326, allow_override=True)
-    convex_hull_polygon = gdf.unary_union.convex_hull
-    convex_hull_gdf = gpd.GeoDataFrame(geometry=[convex_hull_polygon], crs=gdf.crs)
-    convex_hull_shapefile = os.path.join(output_dir, "convex_hull_polygon.shp")
-    convex_hull_gdf.to_file(convex_hull_shapefile)
-    print(f"Convex hull shapefile written to: {convex_hull_shapefile}")
-    
-    if use_bluetopo:
-        # Define the expected VRT directory and path based on the title
-        vrt_dir = os.path.join(output_dir, f"BlueTopo_VRT_{title}")
-        vrt_path = os.path.join(vrt_dir, f"merged_tiles_{title}.vrt")
-
-        # Check if VRT already exists
-        if os.path.exists(vrt_path):
-            print(f"Existing BlueTopo VRT found at {vrt_path}. Skipping new download.")
-            return vrt_path
-    
-        # Create the 'Modeling' folder for downloading tiles
-        bluetopo_tiles_dir = os.path.join(output_dir, "Modeling")
-        os.makedirs(bluetopo_tiles_dir, exist_ok=True)
-
-        # Download BlueTopo tiles
-        from nbs.bluetopo import fetch_tiles
-        fetch_tiles(bluetopo_tiles_dir, convex_hull_shapefile, data_source='modeling')
-
-        # Use the CSV file's title (assumed to be stored in the global variable 'title')
-        bluetopo_tiles_copy = os.path.join(output_dir, f"BlueTopo_Tiles_{title}")
-        if os.path.exists(bluetopo_tiles_copy):
-            shutil.rmtree(bluetopo_tiles_copy)
-        shutil.copytree(bluetopo_tiles_dir, bluetopo_tiles_copy)
-        print(f"Copied BlueTopo tiles to {bluetopo_tiles_copy}")
-        
-        # Build a VRT from the copied tiles using a unique folder name that includes the title.
-        vrt_dir = os.path.join(output_dir, f"BlueTopo_VRT_{title}")
-        os.makedirs(vrt_dir, exist_ok=True)
-        
-        # Create glob patterns to find both .tif and .tiff files in the unique tiles folder.
-        tif_pattern = os.path.join(bluetopo_tiles_copy, '**', '*.tif')
-        tiff_pattern = os.path.join(bluetopo_tiles_copy, '**', '*.tiff')
-        print(f"[DEBUG] Glob pattern for .tif: {tif_pattern}")
-        print(f"[DEBUG] Glob pattern for .tiff: {tiff_pattern}")
-        tile_files = glob.glob(tif_pattern, recursive=True) + glob.glob(tiff_pattern, recursive=True)
-        print("[DEBUG] Found the following tile files for VRT building:")
-        for f in tile_files:
-            print("  ", f)
-        
-        if not tile_files:
-            raise RuntimeError("No BlueTopo GeoTIFF files were found in " + bluetopo_tiles_copy)
-        
-        # Save the VRT file with the title appended to the file name.
-        vrt_path = os.path.join(vrt_dir, f"merged_tiles_{title}.vrt")
-        vrt = gdal.BuildVRT(vrt_path, tile_files)
-        vrt = None  # Close the VRT dataset
-        print(f"Created VRT at {vrt_path}")
-        return vrt_path
-    else:
-        # If not using automated download, assume BAG_filepath is provided by the user.
+def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetopo=True, reference_context=None):
+    """Compatibility entry point; select tiles by points rather than a convex hull."""
+    if not use_bluetopo:
         return BAG_filepath
+    if reference_context is None:
+        raise ValueError('Automatic Modeling reference requires a per-run catalog snapshot.')
+    context = reference_context
+    selected, missing, total = select_modeling_tiles(csb_data_path, context['catalog'])
+    record = {'source_csv': str(Path(csb_data_path).resolve()), 'source_sha256': file_sha256(csb_data_path),
+              'soundings': total, 'outside_catalog': missing, 'tiles': [], 'vrt': None}
+    context['manifest']['inputs'].append(record)
+    write_modeling_manifest(context)
+    if missing:
+        print(f'WARNING: {missing} of {total} soundings are outside NOAA Modeling tile footprints; downloading tiles cannot fill these gaps.')
+    if selected.empty:
+        raise ValueError('No NOAA Modeling tiles cover the input soundings.')
+    files = []
+    for _, row in selected.iterrows():
+        tile = str(row['tile'])
+        if not tile.isalnum():
+            raise ValueError(f'Invalid Modeling tile ID: {tile}')
+        entry = {'tile': tile}
+        for kind, link_column, checksum_column in (
+                ('geotiff', 'GeoTIFF_Link', 'GeoTIFF_SHA256_Checksum'),
+                ('rat', 'RAT_Link', 'RAT_SHA256_Checksum')):
+            checksum = str(row[checksum_column]).strip().lower()
+            if len(checksum) != 64 or any(char not in '0123456789abcdef' for char in checksum):
+                raise ValueError(f'Missing or invalid {kind} SHA256 for Modeling tile {tile}')
+            url = str(row[link_column])
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.scheme != 'https' or parsed.hostname != 'noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com':
+                raise ValueError(f'Unexpected NOAA Modeling download URL: {url}')
+            # Both checksums define a version: GDAL discovers the RAT beside its TIFF.
+            version = str(row['GeoTIFF_SHA256_Checksum']).strip().lower() + '_' + str(row['RAT_SHA256_Checksum']).strip().lower()
+            if any(char not in '0123456789abcdef_' for char in version):
+                raise ValueError(f'Invalid Modeling version for tile {tile}')
+            version_key = hashlib.sha256(version.encode('ascii')).hexdigest()
+            path = context['cache'] / 'tiles' / tile / version_key / Path(parsed.path).name
+            working = context['working_tiles'].get(tile)
+            disk_field = 'geotiff_disk' if kind == 'geotiff' else 'rat_disk'
+            if not working or not working.get(disk_field):
+                raise RuntimeError(f'NOAA registry has no downloaded {kind} for required tile {tile}')
+            source = (context['workspace'] / working[disk_field]).resolve()
+            source.relative_to(context['workspace'])
+            if source.name != Path(parsed.path).name:
+                raise RuntimeError(f'NOAA working filename differs from catalog for tile {tile}')
+            archive_modeling_file(source, path, checksum)
+            entry[kind + '_sha256'] = checksum
+            entry[kind + '_path'] = str(path.resolve())
+            entry[kind + '_url'] = url
+        files.append(entry['geotiff_path'])
+        record['tiles'].append(entry)
+        write_modeling_manifest(context)
+    identity = json.dumps(record['tiles'], sort_keys=True).encode('utf-8')
+    tile_set_hash = hashlib.sha256(identity).hexdigest()
+    vrt_path = context['cache'] / 'vrts' / tile_set_hash / 'reference.vrt'
+    # Rebuilding lightweight VRT metadata validates sources without downloading verified tiles.
+    record['vrt'] = build_modeling_vrt(files, vrt_path)
+    write_modeling_manifest(context)
+    print(f"Modeling reference: {len(files)} verified tiles; VRT {record['vrt']}")
+    return record['vrt']
 
 
 
@@ -2063,9 +2190,7 @@ def cleanup_interim_files(output_dir, title):
     print(f"\n--- Cleaning up interim files for {title} ---")
     
     # List of folder paths to remove
-    folders_to_remove = [
-        os.path.join(output_dir, "Modeling")
-    ]
+    folders_to_remove = []  # Shared reference caches and legacy downloads are retained.
     
     for folder in folders_to_remove:
         try:
@@ -2237,7 +2362,12 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
         # A final grid is not evidence that a particular CSV has been ingested.
         # Use the persistent file ledger instead; do not scan input subfolders.
         csv_files = sorted(str(path) for path in Path(csb_directory).glob("*.csv"))
-        if not options.bluetopo:
+        modeling_reference = None
+        if options.bluetopo:
+            pending = [path for path in csv_files
+                       if not options.duckdb or not already_ingested(db_path, path)]
+            modeling_reference = initialize_modeling_reference(output_dir, run_directory, pending)
+        else:
             record_local_reference(options.reference_bathymetry, run_directory)
         for csb_file in csv_files:
             csb = csb_file
@@ -2248,15 +2378,8 @@ def process_csb_for_directory(csb_directory, root_window=None, settings=None):
 
             print(f"Processing {csb} with title: {title}")
             try:
-                modeling_dir_path = os.path.join(output_dir, "Modeling")
-                try:
-                    shutil.rmtree(modeling_dir_path)
-                except FileNotFoundError:
-                    pass
-                except Exception as e:
-                    print(f"Error deleting old Modeling folder: {e}")
                 if options.bluetopo:
-                    BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir, use_bluetopo=True)
+                    BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir, use_bluetopo=True, reference_context=modeling_reference)
                 else:
                     BAG_filepath = options.reference_bathymetry
                 
