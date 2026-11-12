@@ -22,8 +22,14 @@ also allows option for FES2022b tides which reference to approximate LAT (not ML
 
 """
 
-import tkinter as tk
-from tkinter import filedialog, ttk
+import argparse
+import hashlib
+import json
+import tempfile
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from types import SimpleNamespace
+import sys
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -51,12 +57,14 @@ import glob
 import subprocess
 import duckdb
 import gc
-from pathlib import Path
-import sys
-sys.path.append(r"C:\Pydro24\NOAA\site-packages\Python3\svn_repo\HSTB\CSB_processing")
+# Resolve support files beside this script when installed with Pydro; the
+# project-local copy can use this computer's existing Pydro support directory.
+PYDRO_CSB_DIR = Path(__file__).resolve().parent
+if not (PYDRO_CSB_DIR / "fes_model.py").is_file():
+    PYDRO_CSB_DIR = Path(r"C:\Pydro24\NOAA\site-packages\Python3\svn_repo\HSTB\CSB_processing")
+sys.path.append(str(PYDRO_CSB_DIR))
 from fes_model import get_fes_tide, get_lat_separation
 import logging
-import sys
 
 
 # --- IMPORTS for post-processing analysis ---
@@ -74,19 +82,12 @@ csb = ""
 BAG_filepath = ""
 fp_zones = ""
 output_dir = ""
+run_directory = None  # Per-run reports; output_dir remains the shared state root.
 resolution = 20  # resolution of quick-look geotiff raster
 MASTER_OFFSET_FILE = os.path.join(output_dir, "master_offsets.csv")
 
 pd.set_option('display.max_columns', None)
 
-
-
-import hashlib
-import json
-import tempfile
-from types import SimpleNamespace
-from email.utils import parsedate_to_datetime
-_last_tide_request = None
 
 def setup_logging(output_dir, run_timestamp=None):
     """Configures logging to print to both console and a file."""
@@ -259,12 +260,12 @@ def rasterize_CSB(master_offsets_df):
     csb_corr1 = draft_corr(master_offsets_df)
     
     #Based on GUI options, insert processed data into DuckDB.
-    if duckdb_option_var.get():
+    if options.duckdb:
         duckdb_path = os.path.join(output_dir, "csb.duckdb")
         insert_into_duckdb(csb_corr1, duckdb_path)
     
     # Optionally export as geopackage if the checkbox is selected.
-    if export_gp_var.get():
+    if options.export_initial_gpkg:
         gpkg_path = os.path.join(output_dir, 'csb_processed_'+ title +'.gpkg')
         print('*****Exporting processed CSB data to geopackage*****')
         csb_corr1.to_file(gpkg_path, driver='GPKG', layer='csb')
@@ -360,6 +361,21 @@ def mosaic_tiles(tiles_dir):
     return mosaic_raster_path
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetopo=True):
     """
     Loads CSB data, builds a convex hull, and writes it to a shapefile.
@@ -431,7 +447,8 @@ def create_convex_hull_and_download_tiles(csb_data_path, output_dir, use_bluetop
         # If not using automated download, assume BAG_filepath is provided by the user.
         return BAG_filepath
 
-    
+
+
 def reproject_raster(input_raster, output_raster, dst_crs):
     with rasterio.open(input_raster) as src:
         transform, width, height = calculate_default_transform(
@@ -471,8 +488,8 @@ def apply_fes_tides(gdf):
         gdf = gdf.rename(columns={'depth': 'depth_old'})
         return gdf
     
-    fes_data_path = fes_path_var.get()
-    fes_yaml_path = fes_yaml_var.get()
+    fes_data_path = options.fes_data
+    fes_yaml_path = options.fes_config
 
     if not fes_data_path or not fes_yaml_path:
         raise ValueError("FES Model requires both a data path and a YAML config file.")
@@ -499,6 +516,51 @@ def apply_fes_tides(gdf):
     
     print("***** FES tide correction complete. Depths are referenced to approx. LAT. *****")
     return gdf
+
+
+_last_tide_request = None
+
+
+def tide_request_settings():
+    """Use an isolated run cache unless the caller explicitly overrides it."""
+    settings = globals().get('options')
+    return SimpleNamespace(
+        delay=float(getattr(settings, 'tide_request_delay', 0.2)),
+        retries=int(getattr(settings, 'tide_retries', 3)),
+        backoff=float(getattr(settings, 'tide_retry_wait', 30.0)),
+        cache=Path(getattr(settings, 'tide_cache', '') or
+                   Path(output_dir) / 'tide_cache'),
+    )
+
+
+def tide_payload_frame(data):
+    """Validate records before caching; an API error is not a tide series."""
+    records = data.get('predictions', data.get('data'))
+    if not isinstance(records, list) or not records:
+        raise ValueError('Response has no tide records')
+    df = pd.DataFrame(records)
+    if not {'t', 'v'}.issubset(df.columns):
+        raise ValueError('Tide records are missing t or v')
+    df['t'] = pd.to_datetime(df['t'], errors='raise')
+    df['v'] = pd.to_numeric(df['v'], errors='coerce')
+    df = df.dropna(subset=['t', 'v'])
+    df = df[np.isfinite(df['v'])]
+    if df.empty:
+        raise ValueError('Response has no usable tide records')
+    return df
+
+
+def save_tide_diagnostic(folder, key, url, attempt, response=None, error=None):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f'{time.time_ns()}_{key[:12]}_attempt{attempt}.json'
+    path.write_text(json.dumps({
+        'url': url, 'attempt': attempt, 'error': str(error) if error else None,
+        'status': response.status_code if response is not None else None,
+        'headers': dict(response.headers) if response is not None else {},
+        'body': response.text if response is not None else None,
+    }, indent=2), encoding='utf-8')
+    print(f'NOAA request diagnostic saved: {path}')
+    return path
 
 
 def fetch_tide_data(station_id, start_date, end_date, product, interval=None, attempt_great_lakes=False):
@@ -736,10 +798,94 @@ def create_survey_outline(raster_path, output_dir, title, desired_resolution=8, 
         return bathy_polygon_shp
 
 
+def match_zone_tides(soundings, tides, max_time_gap="1h"):
+    """Attach v_new and t_new without mixing stations or zone time shifts.
+
+    soundings must contain time, ControlStn and ATCorr (minutes). tides must
+    contain t, v and tide_station; tag every API response with the requested
+    station before concatenating responses. RR remains on the sounding and is
+    applied by the caller, as in the original processing script.
+
+    Positive ATCorr shifts the station series later, preserving the original
+    sign convention. Match nearest samples; do not introduce new interpolation.
+    Require bracketing series coverage and a nearest sample within one hour
+    (the existing pipeline's internal-gap threshold). Fail instead of quietly
+    assigning another station or extrapolating beyond available coverage.
+    """
+    required = {"time", "ControlStn", "ATCorr"}
+    if not required.issubset(soundings.columns):
+        raise ValueError(f"Missing sounding columns: {sorted(required - set(soundings.columns))}")
+    required = {"t", "v", "tide_station"}
+    if not required.issubset(tides.columns):
+        raise ValueError(f"Missing tide columns: {sorted(required - set(tides.columns))}")
+    if soundings.empty:
+        return soundings.assign(t_new=pd.NaT, v_new=np.nan)
+
+    # Work on copies and restore row order by position, including repeated
+    # GeoDataFrame indices caused by spatial joins.
+    left = soundings.reset_index(drop=True).copy()
+    left["_tide_row_order"] = np.arange(len(left))
+    left["time"] = pd.to_datetime(left["time"], errors="raise")
+    left["ATCorr"] = pd.to_numeric(left["ATCorr"], errors="raise")
+    if left[["time", "ControlStn", "ATCorr"]].isna().any().any():
+        raise ValueError("Soundings have missing times, control stations or zone time corrections")
+    if not np.isfinite(left["ATCorr"]).all():
+        raise ValueError("Zone time corrections must be finite")
+    left["_tide_station_key"] = left["ControlStn"].astype(str)
+
+    right = tides[["t", "v", "tide_station"]].copy()
+    right["t"] = pd.to_datetime(right["t"], errors="raise")
+    right["v"] = pd.to_numeric(right["v"], errors="coerce")
+    right = right.dropna(subset=["t", "v", "tide_station"])
+    right = right[np.isfinite(right["v"])]
+    right["tide_station"] = right["tide_station"].astype(str)
+    tolerance = pd.Timedelta(max_time_gap)
+    if tolerance <= pd.Timedelta(0):
+        raise ValueError("max_time_gap must be positive")
+
+    results = []
+    for (station, offset), group in left.groupby(
+        ["_tide_station_key", "ATCorr"], sort=False
+    ):
+        # Each group has one station and one time correction. Distinct zones
+        # with the same pair can share a lookup; RR stays specific to each row.
+        series = right.loc[right["tide_station"] == station, ["t", "v"]].copy()
+        if series.empty:
+            raise ValueError(f"No usable tide series for control station {station}")
+        # Overlapping API windows may repeat samples. Identical repeats are
+        # harmless; conflicting levels need an explicit upstream source policy.
+        if (series.groupby("t")["v"].nunique() > 1).any():
+            raise ValueError(f"Conflicting tide levels at the same time for station {station}")
+        series = series.drop_duplicates(subset="t").sort_values("t", kind="stable")
+        series["t_new"] = series["t"] + pd.to_timedelta(offset, unit="m")
+        series = series.rename(columns={"v": "v_new"})
+        group = group.drop(columns=["t_new", "v_new"], errors="ignore")
+        matched = pd.merge_asof(
+            group.sort_values("time", kind="stable"),
+            series[["t_new", "v_new"]],
+            left_on="time", right_on="t_new", direction="nearest",
+            tolerance=tolerance,
+        )
+        outside = ~matched["time"].between(series["t_new"].min(), series["t_new"].max())
+        invalid = outside | matched["v_new"].isna()
+        if invalid.any():
+            raise ValueError(
+                f"{int(invalid.sum())} sounding(s) lack usable shifted tide coverage "
+                f"for station {station}, ATCorr={offset} minutes. "
+                f"Require coverage at sounding time and a sample within {tolerance}."
+            )
+        results.append(matched)
+
+    result = pd.concat(results, ignore_index=True).sort_values("_tide_row_order")
+    result = result.drop(columns=["_tide_row_order", "_tide_station_key"])
+    result.index = soundings.index
+    return result
+
+
 def tides():
     gdf = loadCSB()
 
-    if fes_model_var.get():
+    if options.fes:
         # --- Route to the new FES model function ---
         # This path completely bypasses the NOAA zoned tide logic
         csb_corr = apply_fes_tides(gdf)
@@ -1523,7 +1669,7 @@ def run_export_transits(db_path, exports_folder):
                 gc.collect()
 
                 # --- Transit export is optional ---
-                if export_transits_var.get():
+                if options.export_transits:
                     gdf = gpd.GeoDataFrame(group, geometry=gpd.points_from_xy(group.lon, group.lat))
                     gdf.set_crs(epsg=4326, inplace=True)
                     if gdf.empty:
@@ -1575,7 +1721,7 @@ def points_to_raster_average(gdf, out_raster_path, value_col='depth', nodata=100
     Creates a GeoTIFF by averaging point values within each grid cell.
     -- MODIFIED for ROBUSTNESS --
     """
-    resolution = float(grid_resolution_var.get())
+    resolution = float(options.grid_resolution)
     if gdf.crs is None:
         raise ValueError("GeoDataFrame has no CRS. Please set or reproject first.")
 
@@ -1737,7 +1883,7 @@ def run_final_gridding_and_export():
     """
     print("\n***** Starting Final Gridding & Export Stage *****")
     db_path = os.path.join(output_dir, "csb.duckdb")
-    tessellation_shp = tessellation_shp_var.get()
+    tessellation_shp = options.tessellation
     output_folder = os.path.join(output_dir, "final_products")
     density_folder = os.path.join(output_folder, "density_grids")
     os.makedirs(output_folder, exist_ok=True)
@@ -1782,7 +1928,7 @@ def run_final_gridding_and_export():
                 if points_gdf_4326.empty:
                     continue
                 
-                if export_final_gpkg_var.get():
+                if options.export_final_gpkg:
                     gpkg_path = os.path.join(output_folder, f"{polygon_id}_points.gpkg")
                     print(f"  Saving {len(points_gdf_4326)} points to GeoPackage...")
                     points_gdf_4326.to_file(gpkg_path, driver="GPKG")
@@ -1834,7 +1980,7 @@ def run_final_gridding_and_export():
                 crs="EPSG:4326"
             )
             
-            if export_final_gpkg_var.get():
+            if options.export_final_gpkg:
                 gpkg_path = os.path.join(output_folder, "csb_final_points.gpkg")
                 print(f"Saving {len(points_gdf_4326)} points to GeoPackage...")
                 points_gdf_4326.to_file(gpkg_path, driver="GPKG")
@@ -1862,7 +2008,7 @@ def run_final_gridding_and_export():
             except ValueError as e:
                 print(f"Could not process single file output: {e}")
 
-    if organize_vrt_var.get():
+    if options.organize_vrt:
         organize_by_epsg(output_folder)
         create_vrts_for_epsg_folders(output_folder)
         print("\nProcessing Density VRTs...")
@@ -1912,6 +2058,23 @@ def cleanup_interim_files(output_dir, title):
 
 # --- END: FINAL GRIDDING AND EXPORT FUNCTIONS ---
     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def open_file_dialog(var, file_types):
     filename = filedialog.askopenfilename(filetypes=file_types)
     var.set(filename)
@@ -1925,15 +2088,19 @@ def process_csb_threaded():
     if not os.path.isdir(csb_directory):
         print("Selected path is not a directory.")
         return
-    processing_thread = threading.Thread(target=process_csb_for_directory, args=(csb_directory, root))
+    settings = settings_from_gui()
+    # Capture Tk values on the GUI thread; processing uses plain settings.
+    processing_thread = threading.Thread(target=process_csb_for_directory, args=(csb_directory, root, settings))
     processing_thread.start()
 
-def process_csb_for_directory(csb_directory, root_window):
+def process_csb_for_directory(csb_directory, root_window=None, settings=None):
     start_time = time.time()
-    global csb, title, fp_zones, use_bluetopo, output_dir, BAG_filepath
-    csb = csb_var.get()
-    fp_zones = fp_zones_var.get()
-    output_dir = output_dir_var.get()
+    global csb, title, fp_zones, use_bluetopo, output_dir, BAG_filepath, options
+    options = settings if settings is not None else settings_from_gui()
+    csb = options.csb_directory
+    fp_zones = options.tide_zones
+    output_dir = options.output_directory
+    os.makedirs(output_dir, exist_ok=True)
     setup_logging(output_dir)
     csb_directory = os.path.abspath(csb_directory)
     fp_zones = os.path.abspath(fp_zones)
@@ -1969,10 +2136,10 @@ def process_csb_for_directory(csb_directory, root_window):
             except Exception as e:
                 print(f"Error deleting old Modeling folder: {e}")
             
-            if bluetopo_var.get():
+            if options.bluetopo:
                 BAG_filepath = create_convex_hull_and_download_tiles(csb, output_dir, use_bluetopo=True)
             else:
-                BAG_filepath = BAG_filepath_var.get()
+                BAG_filepath = options.reference_bathymetry
             
             # ---Pass the master_offsets_df to rasterize_CSB ---
             rasterize_CSB(master_offsets_df)
@@ -1982,7 +2149,7 @@ def process_csb_for_directory(csb_directory, root_window):
         finally:
             cleanup_interim_files(output_dir, title)
 
-    if run_analysis_var.get():
+    if options.analysis:
         print("\n***** Starting Post-Processing Analysis *****")
         db_path = os.path.join(output_dir, "csb.duckdb")
         hist_export_dir = os.path.join(output_dir, "histograms")
@@ -1995,7 +2162,7 @@ def process_csb_for_directory(csb_directory, root_window):
             run_apply_best_offsets(db_path)
             run_export_transits(db_path, exports_folder) # This now checks internally if it should run
             
-    if run_final_grid_var.get():
+    if options.final_grid:
         run_final_gridding_and_export()
             
     end_time = time.time()
@@ -2003,302 +2170,309 @@ def process_csb_for_directory(csb_directory, root_window):
     minutes, seconds = divmod(duration, 60)
     print(f"***** ALL STAGES DONE! Total processing time: {int(minutes)} minutes and {seconds:.1f} seconds")
     print("processing complete. closing application window.")
-    root_window.destroy()
+    if root_window is not None:
+        root_window.destroy()
 
 
-def tide_request_settings():
-    """Use an isolated run cache unless the caller explicitly overrides it."""
-    settings = globals().get('options')
+def settings_from_gui():
+    """Capture GUI values before starting the processing thread."""
     return SimpleNamespace(
-        delay=float(getattr(settings, 'tide_request_delay', 0.2)),
-        retries=int(getattr(settings, 'tide_retries', 3)),
-        backoff=float(getattr(settings, 'tide_retry_wait', 30.0)),
-        cache=Path(getattr(settings, 'tide_cache', '') or
-                   Path(output_dir) / 'tide_cache'),
+        csb_directory=csb_var.get(),
+        tide_zones=fp_zones_var.get(),
+        output_directory=output_dir_var.get(),
+        reference_bathymetry=BAG_filepath_var.get(),
+        bluetopo=bluetopo_var.get(),
+        duckdb=duckdb_option_var.get(),
+        export_initial_gpkg=export_gp_var.get(),
+        analysis=run_analysis_var.get(),
+        export_transits=export_transits_var.get(),
+        final_grid=run_final_grid_var.get(),
+        organize_vrt=organize_vrt_var.get(),
+        tessellation=tessellation_shp_var.get(),
+        grid_resolution=grid_resolution_var.get(),
+        export_final_gpkg=export_final_gpkg_var.get(),
+        fes=fes_model_var.get(),
+        fes_data=fes_path_var.get(),
+        fes_config=fes_yaml_var.get(),
     )
 
-def tide_payload_frame(data):
-    """Validate records before caching; an API error is not a tide series."""
-    records = data.get('predictions', data.get('data'))
-    if not isinstance(records, list) or not records:
-        raise ValueError('Response has no tide records')
-    df = pd.DataFrame(records)
-    if not {'t', 'v'}.issubset(df.columns):
-        raise ValueError('Tide records are missing t or v')
-    df['t'] = pd.to_datetime(df['t'], errors='raise')
-    df['v'] = pd.to_numeric(df['v'], errors='coerce')
-    df = df.dropna(subset=['t', 'v'])
-    df = df[np.isfinite(df['v'])]
-    if df.empty:
-        raise ValueError('Response has no usable tide records')
-    return df
 
-def save_tide_diagnostic(folder, key, url, attempt, response=None, error=None):
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f'{time.time_ns()}_{key[:12]}_attempt{attempt}.json'
-    path.write_text(json.dumps({
-        'url': url, 'attempt': attempt, 'error': str(error) if error else None,
-        'status': response.status_code if response is not None else None,
-        'headers': dict(response.headers) if response is not None else {},
-        'body': response.text if response is not None else None,
-    }, indent=2), encoding='utf-8')
-    print(f'NOAA request diagnostic saved: {path}')
-    return path
+def launch_gui():
+    """Build the original interface only when GUI mode is requested."""
+    global root, tk, filedialog, ttk
+    global csb_var, fp_zones_var, output_dir_var, BAG_filepath_var, bluetopo_var, duckdb_option_var, export_gp_var, run_analysis_var, export_transits_var, run_final_grid_var, organize_vrt_var, tessellation_shp_var, grid_resolution_var, export_final_gpkg_var, fes_model_var, fes_path_var, fes_yaml_var
+    import tkinter as tk
+    from tkinter import filedialog, ttk
 
-def match_zone_tides(soundings, tides, max_time_gap="1h"):
-    """Attach v_new and t_new without mixing stations or zone time shifts.
-
-    soundings must contain time, ControlStn and ATCorr (minutes). tides must
-    contain t, v and tide_station; tag every API response with the requested
-    station before concatenating responses. RR remains on the sounding and is
-    applied by the caller, as in the original processing script.
-
-    Positive ATCorr shifts the station series later, preserving the original
-    sign convention. Match nearest samples; do not introduce new interpolation.
-    Require bracketing series coverage and a nearest sample within one hour
-    (the existing pipeline's internal-gap threshold). Fail instead of quietly
-    assigning another station or extrapolating beyond available coverage.
-    """
-    required = {"time", "ControlStn", "ATCorr"}
-    if not required.issubset(soundings.columns):
-        raise ValueError(f"Missing sounding columns: {sorted(required - set(soundings.columns))}")
-    required = {"t", "v", "tide_station"}
-    if not required.issubset(tides.columns):
-        raise ValueError(f"Missing tide columns: {sorted(required - set(tides.columns))}")
-    if soundings.empty:
-        return soundings.assign(t_new=pd.NaT, v_new=np.nan)
-
-    # Work on copies and restore row order by position, including repeated
-    # GeoDataFrame indices caused by spatial joins.
-    left = soundings.reset_index(drop=True).copy()
-    left["_tide_row_order"] = np.arange(len(left))
-    left["time"] = pd.to_datetime(left["time"], errors="raise")
-    left["ATCorr"] = pd.to_numeric(left["ATCorr"], errors="raise")
-    if left[["time", "ControlStn", "ATCorr"]].isna().any().any():
-        raise ValueError("Soundings have missing times, control stations or zone time corrections")
-    if not np.isfinite(left["ATCorr"]).all():
-        raise ValueError("Zone time corrections must be finite")
-    left["_tide_station_key"] = left["ControlStn"].astype(str)
-
-    right = tides[["t", "v", "tide_station"]].copy()
-    right["t"] = pd.to_datetime(right["t"], errors="raise")
-    right["v"] = pd.to_numeric(right["v"], errors="coerce")
-    right = right.dropna(subset=["t", "v", "tide_station"])
-    right = right[np.isfinite(right["v"])]
-    right["tide_station"] = right["tide_station"].astype(str)
-    tolerance = pd.Timedelta(max_time_gap)
-    if tolerance <= pd.Timedelta(0):
-        raise ValueError("max_time_gap must be positive")
-
-    results = []
-    for (station, offset), group in left.groupby(
-        ["_tide_station_key", "ATCorr"], sort=False
-    ):
-        # Each group has one station and one time correction. Distinct zones
-        # with the same pair can share a lookup; RR stays specific to each row.
-        series = right.loc[right["tide_station"] == station, ["t", "v"]].copy()
-        if series.empty:
-            raise ValueError(f"No usable tide series for control station {station}")
-        # Overlapping API windows may repeat samples. Identical repeats are
-        # harmless; conflicting levels need an explicit upstream source policy.
-        if (series.groupby("t")["v"].nunique() > 1).any():
-            raise ValueError(f"Conflicting tide levels at the same time for station {station}")
-        series = series.drop_duplicates(subset="t").sort_values("t", kind="stable")
-        series["t_new"] = series["t"] + pd.to_timedelta(offset, unit="m")
-        series = series.rename(columns={"v": "v_new"})
-        group = group.drop(columns=["t_new", "v_new"], errors="ignore")
-        matched = pd.merge_asof(
-            group.sort_values("time", kind="stable"),
-            series[["t_new", "v_new"]],
-            left_on="time", right_on="t_new", direction="nearest",
-            tolerance=tolerance,
-        )
-        outside = ~matched["time"].between(series["t_new"].min(), series["t_new"].max())
-        invalid = outside | matched["v_new"].isna()
-        if invalid.any():
-            raise ValueError(
-                f"{int(invalid.sum())} sounding(s) lack usable shifted tide coverage "
-                f"for station {station}, ATCorr={offset} minutes. "
-                f"Require coverage at sounding time and a sample within {tolerance}."
-            )
-        results.append(matched)
-
-    result = pd.concat(results, ignore_index=True).sort_values("_tide_row_order")
-    result = result.drop(columns=["_tide_row_order", "_tide_station_key"])
-    result.index = soundings.index
-    return result
-
-# --- GUI SETUP ---
-root = tk.Tk()
-root.title("CSB Processing Pipeline")
-root.geometry("975x750")
+    # --- GUI SETUP ---
+    root = tk.Tk()
+    root.title("CSB Processing Pipeline")
+    root.geometry("975x800")
 
 
-# --- Main Frame ---
-main_frame = ttk.Frame(root, padding="10")
-main_frame.pack(fill=tk.BOTH, expand=True)
+    # --- Main Frame ---
+    main_frame = ttk.Frame(root, padding="10")
+    main_frame.pack(fill=tk.BOTH, expand=True)
 
-# --- Variable Definitions ---
-csb_var = tk.StringVar()
-BAG_filepath_var = tk.StringVar()
-fp_zones_var = tk.StringVar()
-output_dir_var = tk.StringVar()
-tessellation_shp_var = tk.StringVar()
-grid_resolution_var = tk.StringVar(value="10")
-export_final_gpkg_var=tk.BooleanVar(value=True)
-fes_model_var = tk.BooleanVar(value=False)
-fes_path_var = tk.StringVar()
-fes_yaml_var = tk.StringVar()
+    # --- Variable Definitions ---
+    csb_var = tk.StringVar()
+    BAG_filepath_var = tk.StringVar()
+    fp_zones_var = tk.StringVar()
+    output_dir_var = tk.StringVar()
+    tessellation_shp_var = tk.StringVar()
+    grid_resolution_var = tk.StringVar(value="10")
+    export_final_gpkg_var=tk.BooleanVar(value=True)
+    fes_model_var = tk.BooleanVar(value=False)
+    fes_path_var = tk.StringVar()
+    fes_yaml_var = tk.StringVar()
 
 
 
-# BooleanVars for options
-bluetopo_var = tk.BooleanVar()
-duckdb_option_var = tk.BooleanVar(value=True)
-export_gp_var = tk.BooleanVar(value=False)
-run_analysis_var = tk.BooleanVar(value=True)
-export_transits_var = tk.BooleanVar(value=False)
-run_final_grid_var = tk.BooleanVar(value=True)
-organize_vrt_var = tk.BooleanVar(value=True)
+    # BooleanVars for options
+    bluetopo_var = tk.BooleanVar()
+    duckdb_option_var = tk.BooleanVar(value=True)
+    export_gp_var = tk.BooleanVar(value=False)
+    run_analysis_var = tk.BooleanVar(value=True)
+    # Off by default to preserve published historical depths unless requested.
+    export_transits_var = tk.BooleanVar(value=False)
+    run_final_grid_var = tk.BooleanVar(value=True)
+    organize_vrt_var = tk.BooleanVar(value=True)
 
-# --- Input Files Section ---
-input_frame = ttk.LabelFrame(main_frame, text="1. Input Files & Folders", padding="10")
-input_frame.pack(fill=tk.X, expand=True, pady=5)
+    # --- Input Files Section ---
+    input_frame = ttk.LabelFrame(main_frame, text="1. Input Files & Folders", padding="10")
+    input_frame.pack(fill=tk.X, expand=True, pady=5)
 
-ttk.Label(input_frame, text='Raw CSB CSV Directory').grid(row=0, column=0, sticky='w', padx=5, pady=2)
-csb_dir_entry = ttk.Entry(input_frame, textvariable=csb_var, width=60)
-csb_dir_entry.grid(row=0, column=1)
-ttk.Button(input_frame, text='Browse', command=lambda: open_folder_dialog(csb_var)).grid(row=0, column=2, padx=5)
+    ttk.Label(input_frame, text='Raw CSB CSV Directory').grid(row=0, column=0, sticky='w', padx=5, pady=2)
+    csb_dir_entry = ttk.Entry(input_frame, textvariable=csb_var, width=60)
+    csb_dir_entry.grid(row=0, column=1)
+    ttk.Button(input_frame, text='Browse', command=lambda: open_folder_dialog(csb_var)).grid(row=0, column=2, padx=5)
 
-ttk.Label(input_frame, text='Tide Zone Shapefile').grid(row=1, column=0, sticky='w', padx=5, pady=2)
-fp_zones_entry = ttk.Entry(input_frame, textvariable=fp_zones_var, width=60)
-fp_zones_entry.grid(row=1, column=1)
-ttk.Button(input_frame, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=1, column=2, padx=5)
+    ttk.Label(input_frame, text='Tide Zone Shapefile').grid(row=1, column=0, sticky='w', padx=5, pady=2)
+    fp_zones_entry = ttk.Entry(input_frame, textvariable=fp_zones_var, width=60)
+    fp_zones_entry.grid(row=1, column=1)
+    ttk.Button(input_frame, text='Browse', command=lambda: open_file_dialog(fp_zones_var, [("Shapefile", "*.shp")])).grid(row=1, column=2, padx=5)
 
-ttk.Label(input_frame, text='Output Directory').grid(row=2, column=0, sticky='w', padx=5, pady=2)
-output_dir_entry = ttk.Entry(input_frame, textvariable=output_dir_var, width=60)
-output_dir_entry.grid(row=2, column=1)
-ttk.Button(input_frame, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=2, column=2, padx=5)
+    ttk.Label(input_frame, text='Output Directory').grid(row=2, column=0, sticky='w', padx=5, pady=2)
+    output_dir_entry = ttk.Entry(input_frame, textvariable=output_dir_var, width=60)
+    output_dir_entry.grid(row=2, column=1)
+    ttk.Button(input_frame, text='Browse', command=lambda: open_folder_dialog(output_dir_var)).grid(row=2, column=2, padx=5)
 
-# --- Reference Bathymetry Section ---
-ref_bathy_frame = ttk.LabelFrame(main_frame, text="2. Reference Bathymetry", padding="10")
-ref_bathy_frame.pack(fill=tk.X, expand=True, pady=5)
+    # --- Reference Bathymetry Section ---
+    ref_bathy_frame = ttk.LabelFrame(main_frame, text="2. Reference Bathymetry", padding="10")
+    ref_bathy_frame.pack(fill=tk.X, expand=True, pady=5)
 
-bluetopo_checkbox = ttk.Checkbutton(ref_bathy_frame, text="Use Automated BlueTopo Download", variable=bluetopo_var)
-bluetopo_checkbox.grid(row=0, column=0, columnspan=3, sticky='w', padx=5, pady=2)
+    bluetopo_checkbox = ttk.Checkbutton(ref_bathy_frame, text="Use Automated BlueTopo Download", variable=bluetopo_var)
+    bluetopo_checkbox.grid(row=0, column=0, columnspan=3, sticky='w', padx=5, pady=2)
 
-ttk.Label(ref_bathy_frame, text='Local BAG/GeoTiff File').grid(row=1, column=0, sticky='w', padx=5, pady=2)
-BAG_filepath_entry = ttk.Entry(ref_bathy_frame, textvariable=BAG_filepath_var, width=60)
-BAG_filepath_entry.grid(row=1, column=1)
-ttk.Button(ref_bathy_frame, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG or GeoTIFF file", "*.bag;*.tif;*.tiff")])).grid(row=1, column=2, padx=5)
-
-
-# --- Processing Options Section ---
-options_frame = ttk.LabelFrame(main_frame, text="3. Processing & Export Options", padding="10")
-options_frame.pack(fill=tk.X, expand=True, pady=5)
-
-row_num = 0
-
-ttk.Checkbutton(options_frame, text="Insert into DuckDB (Required for all post-processing)", variable=duckdb_option_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
-row_num += 1
-
-ttk.Checkbutton(options_frame, text="Export Initial Processed Geopackage (per input file)", variable=export_gp_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
-row_num += 1
-
-ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
-row_num += 1
-
-# Post-Processing Options
-ttk.Checkbutton(options_frame, text="Run Post-Processing (Outlier Flagging, etc.)", variable=run_analysis_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
-row_num += 1
-
-export_transits_checkbox = ttk.Checkbutton(options_frame, text="Export Individual Transit Files (GPKG & GeoTIFF)", variable=export_transits_var)
-export_transits_checkbox.grid(row=row_num, column=0, sticky='w', padx=25)
-row_num += 1
-
-# --- FES Model Section (Our new widgets) ---
-ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
-row_num += 1
-
-fes_checkbox = ttk.Checkbutton(options_frame, text="Use FES Tide Model (for non-US waters) - user must download AVISO FES2022b ocean_tide model from AVISO website", variable=fes_model_var)
-fes_checkbox.grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
-row_num += 1
-
-ttk.Label(options_frame, text='FES Model Data Path').grid(row=row_num, column=0, sticky='w', padx=25)
-fes_path_entry = ttk.Entry(options_frame, textvariable=fes_path_var, width=45)
-fes_path_entry.grid(row=row_num, column=1, sticky='w')
-fes_path_button = ttk.Button(options_frame, text='Browse', command=lambda: open_folder_dialog(fes_path_var))
-fes_path_button.grid(row=row_num, column=2, padx=5)
-row_num += 1
+    ttk.Label(ref_bathy_frame, text='Local BAG/GeoTiff File').grid(row=1, column=0, sticky='w', padx=5, pady=2)
+    BAG_filepath_entry = ttk.Entry(ref_bathy_frame, textvariable=BAG_filepath_var, width=60)
+    BAG_filepath_entry.grid(row=1, column=1)
+    ttk.Button(ref_bathy_frame, text='Browse', command=lambda: open_file_dialog(BAG_filepath_var, [("BAG or GeoTIFF file", "*.bag;*.tif;*.tiff")])).grid(row=1, column=2, padx=5)
 
 
-ttk.Label(options_frame, text='FES Config YAML File').grid(row=row_num, column=0, sticky='w', padx=25)
-fes_yaml_entry = ttk.Entry(options_frame, textvariable=fes_yaml_var, width=45)
-fes_yaml_entry.grid(row=row_num, column=1, sticky='w')
-fes_yaml_button = ttk.Button(options_frame, text='Browse', command=lambda: open_file_dialog(fes_yaml_var, [("YAML file", "*.yml")]))
-fes_yaml_button.grid(row=row_num, column=2, padx=5)
-row_num += 1
+    # --- Processing Options Section ---
+    options_frame = ttk.LabelFrame(main_frame, text="3. Processing & Export Options", padding="10")
+    options_frame.pack(fill=tk.X, expand=True, pady=5)
 
-ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
-row_num += 1
+    row_num = 0
 
-# Final Gridding Options
-final_grid_checkbox = ttk.Checkbutton(options_frame, text="Run Final Gridding & Export", variable=run_final_grid_var)
-final_grid_checkbox.grid(row=row_num, column=0, sticky='w', padx=5)
-row_num += 1
+    ttk.Checkbutton(options_frame, text="Insert into DuckDB (Required for all post-processing)", variable=duckdb_option_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
+    row_num += 1
 
-gpkg_export_checkbox=ttk.Checkbutton(options_frame, text="Export Final Points GeoPackage (in epsg:4326)", variable=export_final_gpkg_var)
-gpkg_export_checkbox.grid(row=row_num,column=0,columnspan=2,sticky='w',padx=25)
-row_num += 1
+    ttk.Checkbutton(options_frame, text="Export Initial Processed Geopackage (per input file)", variable=export_gp_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
+    row_num += 1
 
-ttk.Label(options_frame, text='Optional Tessellation Shapefile').grid(row=row_num, column=0, sticky='w', padx=25)
-tess_entry = ttk.Entry(options_frame, textvariable=tessellation_shp_var, width=45)
-tess_entry.grid(row=row_num, column=1, sticky='w')
-tess_button = ttk.Button(options_frame, text='Browse', command=lambda: open_file_dialog(tessellation_shp_var, [("Shapefile", "*.shp")]))
-tess_button.grid(row=row_num, column=2, padx=5)
-row_num += 1
+    ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
+    row_num += 1
 
-ttk.Label(options_frame, text='Grid Resolution (meters)').grid(row=row_num, column=0, sticky='w', padx=25)
-res_entry = ttk.Entry(options_frame, textvariable=grid_resolution_var, width=10)
-res_entry.grid(row=row_num, column=1, sticky='w')
-row_num += 1
+    # Post-Processing Options
+    ttk.Checkbutton(options_frame, text="Run Post-Processing (Outlier Flagging, etc.)", variable=run_analysis_var).grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
+    row_num += 1
 
-organize_vrt_checkbox = ttk.Checkbutton(options_frame, text="Organize GeoTIFFs by EPSG and Create VRTs", variable=organize_vrt_var)
-organize_vrt_checkbox.grid(row=row_num, column=0, columnspan=2, sticky='w', padx=25)
-row_num += 1
-# --- Process Button ---
-process_button = ttk.Button(main_frame, text='Start Processing', command=process_csb_threaded)
-process_button.pack(pady=15)
+    # Optional minimal reset: keep historical transits, flags and speeds.
+    row_num += 1
 
-# --- GUI Logic ---
-def on_bluetopo_check():
-    if bluetopo_var.get():
-        BAG_filepath_entry.config(state='disabled')
-        BAG_filepath_var.set("")
+    export_transits_checkbox = ttk.Checkbutton(options_frame, text="Export Individual Transit Files (GPKG & GeoTIFF)", variable=export_transits_var)
+    export_transits_checkbox.grid(row=row_num, column=0, sticky='w', padx=25)
+    row_num += 1
+
+    # --- FES Model Section (Our new widgets) ---
+    ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
+    row_num += 1
+
+    fes_checkbox = ttk.Checkbutton(options_frame, text="Use FES Tide Model (for non-US waters) - user must download AVISO FES2022b ocean_tide model from AVISO website", variable=fes_model_var)
+    fes_checkbox.grid(row=row_num, column=0, columnspan=2, sticky='w', padx=5)
+    row_num += 1
+
+    ttk.Label(options_frame, text='FES Model Data Path').grid(row=row_num, column=0, sticky='w', padx=25)
+    fes_path_entry = ttk.Entry(options_frame, textvariable=fes_path_var, width=45)
+    fes_path_entry.grid(row=row_num, column=1, sticky='w')
+    fes_path_button = ttk.Button(options_frame, text='Browse', command=lambda: open_folder_dialog(fes_path_var))
+    fes_path_button.grid(row=row_num, column=2, padx=5)
+    row_num += 1
+
+
+    ttk.Label(options_frame, text='FES Config YAML File').grid(row=row_num, column=0, sticky='w', padx=25)
+    fes_yaml_entry = ttk.Entry(options_frame, textvariable=fes_yaml_var, width=45)
+    fes_yaml_entry.grid(row=row_num, column=1, sticky='w')
+    fes_yaml_button = ttk.Button(options_frame, text='Browse', command=lambda: open_file_dialog(fes_yaml_var, [("YAML file", "*.yml")]))
+    fes_yaml_button.grid(row=row_num, column=2, padx=5)
+    row_num += 1
+
+    ttk.Separator(options_frame, orient='horizontal').grid(row=row_num, columnspan=3, sticky='ew', pady=5)
+    row_num += 1
+
+    # Final Gridding Options
+    final_grid_checkbox = ttk.Checkbutton(options_frame, text="Run Final Gridding & Export", variable=run_final_grid_var)
+    final_grid_checkbox.grid(row=row_num, column=0, sticky='w', padx=5)
+    row_num += 1
+
+    gpkg_export_checkbox=ttk.Checkbutton(options_frame, text="Export Final Points GeoPackage (in epsg:4326)", variable=export_final_gpkg_var)
+    gpkg_export_checkbox.grid(row=row_num,column=0,columnspan=2,sticky='w',padx=25)
+    row_num += 1
+
+    ttk.Label(options_frame, text='Optional Tessellation Shapefile').grid(row=row_num, column=0, sticky='w', padx=25)
+    tess_entry = ttk.Entry(options_frame, textvariable=tessellation_shp_var, width=45)
+    tess_entry.grid(row=row_num, column=1, sticky='w')
+    tess_button = ttk.Button(options_frame, text='Browse', command=lambda: open_file_dialog(tessellation_shp_var, [("Shapefile", "*.shp")]))
+    tess_button.grid(row=row_num, column=2, padx=5)
+    row_num += 1
+
+    ttk.Label(options_frame, text='Grid Resolution (meters)').grid(row=row_num, column=0, sticky='w', padx=25)
+    res_entry = ttk.Entry(options_frame, textvariable=grid_resolution_var, width=10)
+    res_entry.grid(row=row_num, column=1, sticky='w')
+    row_num += 1
+
+    organize_vrt_checkbox = ttk.Checkbutton(options_frame, text="Organize GeoTIFFs by EPSG and Create VRTs", variable=organize_vrt_var)
+    organize_vrt_checkbox.grid(row=row_num, column=0, columnspan=2, sticky='w', padx=25)
+    row_num += 1
+    # --- Process Button ---
+    process_button = ttk.Button(main_frame, text='Start Processing', command=process_csb_threaded)
+    process_button.pack(pady=15)
+
+    # --- GUI Logic ---
+    def on_bluetopo_check():
+        if bluetopo_var.get():
+            BAG_filepath_entry.config(state='disabled')
+            BAG_filepath_var.set("")
+        else:
+            BAG_filepath_entry.config(state='normal')
+
+    def toggle_analysis_options():
+        state = 'normal' if run_analysis_var.get() else 'disabled'
+        export_transits_checkbox.config(state=state)
+
+    def toggle_final_grid_options():
+        state = 'normal' if run_final_grid_var.get() else 'disabled'
+        tess_entry.config(state=state)
+        tess_button.config(state=state)
+        res_entry.config(state=state)
+        organize_vrt_checkbox.config(state=state)
+        if state == 'disabled':
+            tessellation_shp_var.set("")
+
+    bluetopo_checkbox.config(command=on_bluetopo_check)
+    run_analysis_var.trace_add('write', lambda *args: toggle_analysis_options())
+    run_final_grid_var.trace_add('write', lambda *args: toggle_final_grid_options())
+
+    # Initial state setup
+    on_bluetopo_check()
+    toggle_analysis_options()
+    toggle_final_grid_options()
+    root.mainloop()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="CSB Processing Pipeline: opens the GUI unless --no-gui is supplied.")
+    parser.add_argument("--no-gui", action="store_true", help="Process command-line settings without creating a GUI.")
+    parser.add_argument("--csb-directory", help="Folder containing input CSV files (not recursive).")
+    parser.add_argument("--output-directory", help="Folder for processing outputs.")
+    parser.add_argument("--tide-zones", default=str(PYDRO_CSB_DIR / "BETA_subordinate_tide_zones" / "tide_zone_polygons_new_WGS84_merge.shp"))
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument("--bluetopo", action="store_true", help="Download reference bathymetry automatically.")
+    reference.add_argument("--reference-bathymetry", default="", help="Local reference BAG, GeoTIFF or VRT.")
+    parser.add_argument("--tessellation", default="", help="Optional polygon shapefile for tiled output.")
+    parser.add_argument("--grid-resolution", type=float, default=10, help="Final depth grid cell size in meters (default: 10).")
+    for name, default, help_text in [
+        ("duckdb", True, "Insert processed records into DuckDB."),
+        ("analysis", True, "Run offset refinement and transit/outlier analysis."),
+        ("final-grid", True, "Generate final gridded products."),
+        ("export-final-gpkg", True, "Export final points GeoPackage."),
+        ("organize-vrt", True, "Organize rasters by EPSG and create VRTs."),
+        ("export-initial-gpkg", False, "Export initial processed points per input file."),
+        ("export-transits", False, "Export individual transit products."),
+    ]:
+        parser.add_argument("--" + name, action=argparse.BooleanOptionalAction, default=default, help=help_text)
+    parser.add_argument("--fes", action="store_true", help="Use FES tides instead of NOAA tide zones.")
+    parser.add_argument("--fes-data", default="", help="FES constituent data folder.")
+    parser.add_argument("--fes-config", default=str(PYDRO_CSB_DIR / "fes2022_config.yml"))
+    parser.add_argument("--tide-request-delay", type=float, default=0.2,
+                        help="Minimum seconds between NOAA requests (GUI default: 2).")
+    parser.add_argument("--tide-retries", type=int, default=3,
+                        help="Retries after the initial NOAA request (default: 3).")
+    parser.add_argument("--tide-retry-wait", type=float, default=30.0,
+                        help="Initial retry wait in seconds; doubles each retry (default: 30).")
+    parser.add_argument("--tide-cache", default="",
+                        help="Override the run-local tide cache; an external override is retained after success.")
+    parser.add_argument("--check", action="store_true", help="Validate paths and options without processing or downloading.")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.no_gui:
+        if argv is None:
+            argv = sys.argv[1:]
+        if argv:
+            parser.error("Use --no-gui with command-line processing options")
+        launch_gui()
+        return
+    if not args.csb_directory or not args.output_directory:
+        parser.error("--no-gui requires --csb-directory and --output-directory")
+    if not args.bluetopo and not args.reference_bathymetry:
+        parser.error("--no-gui requires --bluetopo or --reference-bathymetry")
+    if not np.isfinite(args.tide_request_delay) or args.tide_request_delay < 0:
+        parser.error("--tide-request-delay must be finite and nonnegative")
+    if not 0 <= args.tide_retries <= 10:
+        parser.error("--tide-retries must be between 0 and 10")
+    if not np.isfinite(args.tide_retry_wait) or not 0 < args.tide_retry_wait <= 300:
+        parser.error("--tide-retry-wait must be finite, positive and at most 300 seconds")
+    if not Path(args.csb_directory).is_dir():
+        parser.error("--csb-directory must be an existing directory")
+    if not list(Path(args.csb_directory).glob("*.csv")):
+        parser.error("--csb-directory contains no .csv input files")
+    if args.grid_resolution <= 0 or not np.isfinite(args.grid_resolution):
+        parser.error("--grid-resolution must be finite and greater than zero")
+    if (args.analysis or args.final_grid) and not args.duckdb:
+        parser.error("analysis and final gridding require --duckdb")
+    if args.final_grid and not args.analysis:
+        parser.error("final gridding requires --analysis")
+    if args.export_transits and not args.analysis:
+        parser.error("--export-transits requires --analysis")
+    files = [("reference bathymetry", args.reference_bathymetry), ("tessellation", args.tessellation)]
+    if args.fes:
+        if not args.fes_data or not Path(args.fes_data).is_dir():
+            parser.error("--fes requires an existing --fes-data directory")
+        files.append(("FES configuration", args.fes_config))
     else:
-        BAG_filepath_entry.config(state='normal')
+        files.append(("tide zones", args.tide_zones))
+    for label, value in files:
+        if value and not Path(value).is_file():
+            parser.error(f"{label} file does not exist: {value}")
+        if value and Path(value).suffix.lower() == ".shp":
+            for suffix in (".dbf", ".shx", ".prj"):
+                if not Path(value).with_suffix(suffix).is_file():
+                    parser.error(f"Missing shapefile companion: {Path(value).with_suffix(suffix)}")
+    if Path(args.output_directory).resolve() == Path(args.csb_directory).resolve():
+        parser.error("Use separate input and output directories")
+    if args.check:
+        print("Paths and options validated; no processing performed.")
+        for key, value in vars(args).items():
+            print(f"{key}: {value}")
+        return
+    process_csb_for_directory(args.csb_directory, settings=args)
 
-def toggle_analysis_options():
-    state = 'normal' if run_analysis_var.get() else 'disabled'
-    export_transits_checkbox.config(state=state)
-
-def toggle_final_grid_options():
-    state = 'normal' if run_final_grid_var.get() else 'disabled'
-    tess_entry.config(state=state)
-    tess_button.config(state=state)
-    res_entry.config(state=state)
-    organize_vrt_checkbox.config(state=state)
-    if state == 'disabled':
-        tessellation_shp_var.set("")
-
-bluetopo_checkbox.config(command=on_bluetopo_check)
-run_analysis_var.trace_add('write', lambda *args: toggle_analysis_options())
-run_final_grid_var.trace_add('write', lambda *args: toggle_final_grid_options())
-
-# Initial state setup
-on_bluetopo_check()
-toggle_analysis_options()
-toggle_final_grid_options()
 
 if __name__ == "__main__":
-    root.mainloop()
+    main()
